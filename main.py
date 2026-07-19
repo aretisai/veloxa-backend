@@ -66,6 +66,13 @@ def check_hitl_escalation(text: str, trace: list) -> bool:
 # ==========================================
 # RETRIEVAL (Pinecone + Cohere rerank)
 # ==========================================
+def build_search_query(safe_text: str, history: list) -> str:
+    """Fold recent turns into the search query so follow-ups like 'add it' or 'yes'
+    still retrieve the right product, instead of searching on nearly-empty text."""
+    recent = " ".join(msg["text"] for msg in history[-2:])
+    return f"{recent} {safe_text}".strip()
+
+
 @observe(as_type="span", name="Vector_Retrieval")
 def retrieve_relevant_shoes(query: str, trace: list) -> list:
     trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Querying Vector DB...")
@@ -115,7 +122,8 @@ def run_agent(
     cart_actions: list,
     image_part: types.Part | None = None,
 ) -> dict:
-    relevant_shoes = retrieve_relevant_shoes(safe_text, trace)
+    search_query = build_search_query(safe_text, history)
+    relevant_shoes = retrieve_relevant_shoes(search_query, trace)
 
     history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
     system_instruction = f"""
@@ -125,9 +133,10 @@ def run_agent(
 
     DIRECTIVES:
     1. If the user provides an image, use Visual Search to find the closest match in RETRIEVED INVENTORY.
-    2. Only recommend items from RETRIEVED INVENTORY above. If nothing there fits, say so honestly.
-    3. If the user asks to buy or add an item to their cart, trigger the `add_to_cart` tool.
-    4. You must ONLY output strictly formatted JSON matching this exact structure:
+    2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe, size, and color from HISTORY - never ask them to repeat information they already gave you.
+    3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
+    4. If the user asks to buy or add an item to their cart, call the `add_to_cart` tool with the item name and price. Only say an item was added if you actually called the tool this turn - never claim success without calling it.
+    5. You must ONLY output strictly formatted JSON matching this exact structure:
     {{
         "reply": "Your conversational reply...",
         "recommendations": [{{"id": 1, "match_percentage": 95, "reason": "Why it fits.", "recommended_color": "Red"}}]
