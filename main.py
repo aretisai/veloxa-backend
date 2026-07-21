@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pinecone import Pinecone
+import psycopg2
 import cohere
 from langfuse import observe, get_client, propagate_attributes
 
@@ -31,8 +32,58 @@ pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index = pc.Index("veloxa-inventory")
 co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
 
-with open("veloxa_enhanced_catalog.json", "r") as f:
-    catalog = json.load(f).get("catalog", [])
+def load_catalog_from_db() -> list:
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, model, category, gender, price, final_price, cost,
+               gross_margin, gross_margin_pct, financial_tier,
+               colors_available, performance_specs
+        FROM shoes ORDER BY id
+    """)
+    shoe_rows = cur.fetchall()
+
+    cur.execute("SELECT shoe_id, color, size, stock, image FROM inventory ORDER BY shoe_id")
+    inventory_rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    inventory_by_shoe: dict = {}
+    for shoe_id, color, size, stock, image in inventory_rows:
+        inventory_by_shoe.setdefault(shoe_id, []).append(
+            {"color": color, "size": size, "stock": stock, "image": image}
+        )
+
+    result = []
+    for (sid, model, category, gender, price, final_price, cost,
+         gross_margin, gross_margin_pct, financial_tier,
+         colors_available, performance_specs) in shoe_rows:
+        result.append({
+            "id": sid,
+            "model": model,
+            "category": category,
+            "gender": gender,
+            "price": int(price),
+            "finalPrice": int(final_price),
+            "cost": int(cost),
+            "gross_margin": float(gross_margin) if gross_margin is not None else None,
+            "gross_margin_pct": float(gross_margin_pct) if gross_margin_pct is not None else None,
+            "financial_tier": financial_tier,
+            "colors_available": colors_available,
+            "performance_specs": performance_specs,
+            "inventory": inventory_by_shoe.get(sid, []),
+        })
+    return result
+
+
+try:
+    catalog = load_catalog_from_db()
+    print(f"Loaded {len(catalog)} shoes from PostgreSQL.")
+except Exception as e:
+    print(f"Postgres load failed ({e}) - falling back to local JSON.")
+    with open("veloxa_enhanced_catalog.json", "r") as f:
+        catalog = json.load(f).get("catalog", [])
 
 store_policies = {
     "shipping": "Free standard shipping on orders over $150. Expedited shipping is $25.",
@@ -74,6 +125,11 @@ def build_search_query(safe_text: str, history: list) -> str:
     return f"{recent} {safe_text}".strip()
 
 
+def find_shoe_by_id(shoe_id: int) -> dict | None:
+    """Look up a shoe by its catalog id - exact, deterministic, no name-matching involved."""
+    return next((s for s in catalog if s["id"] == shoe_id), None)
+
+
 @observe(as_type="span", name="Vector_Retrieval")
 def retrieve_relevant_shoes(query: str, trace: list) -> list:
     trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Querying Vector DB...")
@@ -104,11 +160,26 @@ def retrieve_relevant_shoes(query: str, trace: list) -> list:
 # ==========================================
 def make_cart_tools(trace: list, cart_actions: list, cart_removals: list, cart_cleared: list):
     @observe(as_type="span", name="Tool_Execution")
-    def add_to_cart(item_name: str, price: float) -> str:
-        """Add an item to the user's shopping cart."""
-        cart_actions.append({"name": item_name, "price": price})
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: add_to_cart('{item_name}', {price})")
-        return f"Success: Added {item_name} to cart for ${price}."
+    def add_to_cart(shoe_id: int) -> str:
+        """Add an item to the user's shopping cart, identified ONLY by its numeric id
+        from RETRIEVED INVENTORY. Name and price are looked up from PostgreSQL directly -
+        never taken from the model, so there is nothing left to hallucinate or mismatch."""
+        matched = find_shoe_by_id(shoe_id)
+
+        if not matched:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Error: add_to_cart called with unknown shoe_id {shoe_id}.")
+            return f"Error: No shoe with id {shoe_id} exists. Ask the user to clarify which item they mean."
+
+        final_name = matched["model"]
+        final_price = matched["finalPrice"]
+
+        cart_actions.append({"name": final_name, "price": final_price})
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: add_to_cart(id={shoe_id}) -> '{final_name}' at ${final_price}, sourced directly from database")
+        return f"Success: Added {final_name} to cart for ${final_price}."
+
+        cart_actions.append({"name": final_name, "price": final_price})
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: add_to_cart('{final_name}', {final_price}) - verified against database")
+        return f"Success: Added {final_name} to cart for ${final_price}."
 
     @observe(as_type="span", name="Tool_Execution")
     def remove_from_cart(item_id: str) -> str:
@@ -155,7 +226,7 @@ def run_agent(
     1. If the user provides an image, use Visual Search to find the closest match in RETRIEVED INVENTORY.
     2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe, size, and color from HISTORY - never ask them to repeat information they already gave you.
     3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
-    4. If the user asks to buy or add an item to their cart, call the `add_to_cart` tool with the item name and price. Only say an item was added if you actually called the tool this turn - never claim success without calling it.
+    4. If the user asks to buy or add an item to their cart, call the `add_to_cart` tool with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn - never claim success without calling it.
     5. If the user asks to remove one specific item from their cart, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" value from CURRENT CART - never invent or guess an id.
     6. If the user asks to remove several specific items, call `remove_from_cart` once per item.
     7. If the user asks to clear, empty, or remove everything from their cart, call `clear_cart` instead of calling remove_from_cart repeatedly.
