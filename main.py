@@ -4,6 +4,7 @@ import time
 import re
 import uuid
 import base64
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -248,6 +249,69 @@ def read_root():
     return {"message": "Veloxa backend is running"}
 
 
+@app.get("/admin/metrics")
+def admin_metrics():
+    langfuse = get_client()
+    to_ts = datetime.now(timezone.utc)
+    from_ts = to_ts - timedelta(days=7)
+
+    result = {
+        "window_days": 7,
+        "total_conversations": None,
+        "avg_response_seconds": None,
+        "escalations": None,
+        "tool_calls": None,
+        "error": None,
+    }
+
+    try:
+        query = json.dumps({
+            "view": "observations",
+            "metrics": [
+                {"measure": "count", "aggregation": "count"},
+                {"measure": "latency", "aggregation": "avg"},
+            ],
+            "dimensions": [{"field": "name"}],
+            "filters": [],
+            "fromTimestamp": from_ts.isoformat(),
+            "toTimestamp": to_ts.isoformat(),
+        })
+        raw = langfuse.api.metrics.metrics(query=query)
+        data = raw.model_dump()["data"] if hasattr(raw, "model_dump") else raw["data"]
+        by_name = {row.get("name"): row for row in data}
+
+        if "Chat_Request" in by_name:
+            row = by_name["Chat_Request"]
+            result["total_conversations"] = int(row.get("count_count", 0))
+            result["avg_response_seconds"] = round(float(row.get("avg_latency", 0)) / 1000, 1)
+
+        if "Tool_Execution" in by_name:
+            result["tool_calls"] = int(by_name["Tool_Execution"].get("count_count", 0))
+
+    except Exception as e:
+        result["error"] = f"overview query failed: {type(e).__name__}: {e}"
+
+    try:
+        esc_query = json.dumps({
+            "view": "observations",
+            "metrics": [{"measure": "count", "aggregation": "count"}],
+            "dimensions": [],
+            "filters": [
+                {"column": "metadata", "operator": "contains", "key": "escalated", "value": "true", "type": "stringObject"}
+            ],
+            "fromTimestamp": from_ts.isoformat(),
+            "toTimestamp": to_ts.isoformat(),
+        })
+        esc_raw = langfuse.api.metrics.metrics(query=esc_query)
+        esc_data = esc_raw.model_dump()["data"] if hasattr(esc_raw, "model_dump") else esc_raw["data"]
+        result["escalations"] = int(esc_data[0]["count_count"]) if esc_data else 0
+    except Exception as e:
+        if not result["error"]:
+            result["error"] = f"escalation query failed: {type(e).__name__}: {e}"
+
+    return result
+
+
 @app.post("/chat")
 @observe(name="Chat_Request")
 def chat(request: ChatRequest):
@@ -264,6 +328,7 @@ def chat(request: ChatRequest):
         safe_text = scrub_pii(request.message, trace)
 
         if check_hitl_escalation(safe_text, trace):
+            get_client().update_current_span(metadata={"escalated": "true"})
             get_client().flush()
             return {
                 "reply": "I am escalating your request to a specialized human agent.",
