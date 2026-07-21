@@ -317,14 +317,14 @@ def run_agent(
         search_query = build_search_query(vision_description or safe_text, history)
         relevant_shoes = retrieve_relevant_shoes(search_query, trace)
 
-        is_premium = any(shoe.get("financial_tier") == "Premium" for shoe in relevant_shoes)
+        is_premium = relevant_shoes[0].get("financial_tier") == "Premium" if relevant_shoes else False
         is_complex = image_part is not None
         model_name = "gemini-3.5-flash" if (is_premium or is_complex) else "gemini-2.5-flash"
 
         if is_premium and is_complex:
-            route_reason = "Premium item + image analysis"
+            route_reason = "Top match is Premium tier + image analysis"
         elif is_premium:
-            route_reason = "Premium item detected"
+            route_reason = "Top match is Premium tier"
         elif is_complex:
             route_reason = "Complex (multimodal) query"
         else:
