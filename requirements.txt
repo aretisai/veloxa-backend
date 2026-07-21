@@ -49,6 +49,7 @@ orjson==3.11.9
 packaging==26.2
 pinecone==9.1.0
 protobuf==7.35.1
+psycopg2-binary==2.9.12
 pyasn1==0.6.4
 pyasn1_modules==0.4.2
 pycparser==3.0
