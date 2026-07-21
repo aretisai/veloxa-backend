@@ -12,8 +12,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pinecone import Pinecone
-import psycopg2
 import cohere
+import psycopg2
 from langfuse import observe, get_client, propagate_attributes
 
 load_dotenv()
@@ -32,6 +32,16 @@ pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index = pc.Index("veloxa-inventory")
 co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
 
+store_policies = {
+    "shipping": "Free standard shipping on orders over $150. Expedited shipping is $25.",
+    "returns": "30-day trial period. Take them for a run!",
+    "exchanges": "Free size and color exchanges within 30 days.",
+}
+
+
+# ==========================================
+# CATALOG: PostgreSQL, with local JSON fallback
+# ==========================================
 def load_catalog_from_db() -> list:
     conn = psycopg2.connect(os.getenv("DATABASE_URL"))
     cur = conn.cursor()
@@ -85,12 +95,6 @@ except Exception as e:
     with open("veloxa_enhanced_catalog.json", "r") as f:
         catalog = json.load(f).get("catalog", [])
 
-store_policies = {
-    "shipping": "Free standard shipping on orders over $150. Expedited shipping is $25.",
-    "returns": "30-day trial period. Take them for a run!",
-    "exchanges": "Free size and color exchanges within 30 days.",
-}
-
 
 # ==========================================
 # GOVERNANCE: PII + HITL
@@ -119,15 +123,8 @@ def check_hitl_escalation(text: str, trace: list) -> bool:
 # RETRIEVAL (Pinecone + Cohere rerank)
 # ==========================================
 def build_search_query(safe_text: str, history: list) -> str:
-    """Fold recent turns into the search query so follow-ups like 'add it' or 'yes'
-    still retrieve the right product, instead of searching on nearly-empty text."""
     recent = " ".join(msg["text"] for msg in history[-2:])
     return f"{recent} {safe_text}".strip()
-
-
-def find_shoe_by_id(shoe_id: int) -> dict | None:
-    """Look up a shoe by its catalog id - exact, deterministic, no name-matching involved."""
-    return next((s for s in catalog if s["id"] == shoe_id), None)
 
 
 @observe(as_type="span", name="Vector_Retrieval")
@@ -155,42 +152,39 @@ def retrieve_relevant_shoes(query: str, trace: list) -> list:
     return [candidates[r.index] for r in rerank_response.results]
 
 
+def find_shoe_by_id(shoe_id: int) -> dict | None:
+    return next((s for s in catalog if s["id"] == shoe_id), None)
+
+
 # ==========================================
 # TOOL CALLING (scoped per-request, not global)
 # ==========================================
 def make_cart_tools(trace: list, cart_actions: list, cart_removals: list, cart_cleared: list):
     @observe(as_type="span", name="Tool_Execution")
     def add_to_cart(shoe_id: int) -> str:
-        """Add an item to the user's shopping cart, identified ONLY by its numeric id
-        from RETRIEVED INVENTORY. Name and price are looked up from PostgreSQL directly -
-        never taken from the model, so there is nothing left to hallucinate or mismatch."""
+        """Add an item to cart, identified ONLY by its numeric id from RETRIEVED INVENTORY.
+        Name and price are looked up from PostgreSQL directly - never taken from the model."""
         matched = find_shoe_by_id(shoe_id)
-
         if not matched:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Error: add_to_cart called with unknown shoe_id {shoe_id}.")
             return f"Error: No shoe with id {shoe_id} exists. Ask the user to clarify which item they mean."
 
         final_name = matched["model"]
         final_price = matched["finalPrice"]
-
         cart_actions.append({"name": final_name, "price": final_price})
         trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: add_to_cart(id={shoe_id}) -> '{final_name}' at ${final_price}, sourced directly from database")
         return f"Success: Added {final_name} to cart for ${final_price}."
 
-        cart_actions.append({"name": final_name, "price": final_price})
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: add_to_cart('{final_name}', {final_price}) - verified against database")
-        return f"Success: Added {final_name} to cart for ${final_price}."
-
     @observe(as_type="span", name="Tool_Execution")
     def remove_from_cart(item_id: str) -> str:
-        """Remove one specific item from the user's shopping cart, identified by its exact id from CURRENT CART."""
+        """Remove one specific item from the cart, identified by its exact id from CURRENT CART."""
         cart_removals.append(item_id)
         trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: remove_from_cart('{item_id}')")
         return f"Success: Removed item {item_id} from cart."
 
     @observe(as_type="span", name="Tool_Execution")
     def clear_cart() -> str:
-        """Remove every item from the user's shopping cart in one action."""
+        """Remove every item from the cart in one action."""
         cart_cleared.append(True)
         trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: clear_cart()")
         return "Success: Cart cleared."
@@ -215,6 +209,15 @@ def run_agent(
     search_query = build_search_query(safe_text, history)
     relevant_shoes = retrieve_relevant_shoes(search_query, trace)
 
+    # Value-based routing: a premium item in the mix earns the stronger model
+    is_premium = any(shoe.get("financial_tier") == "Premium" for shoe in relevant_shoes)
+    model_name = "gemini-3.5-flash" if is_premium else "gemini-2.5-flash"
+    get_client().update_current_span(metadata={"model_tier": "premium" if is_premium else "commodity"})
+    trace.append(
+        f"[{time.strftime('%H:%M:%S')}] Router: "
+        f"{'Premium item detected' if is_premium else 'Commodity-only query'} - routing to {model_name}."
+    )
+
     history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
     system_instruction = f"""
     You are the VELOXA AI Concierge - an enterprise omnichannel shopping assistant.
@@ -224,13 +227,13 @@ def run_agent(
 
     DIRECTIVES:
     1. If the user provides an image, use Visual Search to find the closest match in RETRIEVED INVENTORY.
-    2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe, size, and color from HISTORY - never ask them to repeat information they already gave you.
+    2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe from HISTORY - never ask them to repeat information they already gave you.
     3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
-    4. If the user asks to buy or add an item to their cart, call the `add_to_cart` tool with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn - never claim success without calling it.
-    5. If the user asks to remove one specific item from their cart, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" value from CURRENT CART - never invent or guess an id.
-    6. If the user asks to remove several specific items, call `remove_from_cart` once per item.
-    7. If the user asks to clear, empty, or remove everything from their cart, call `clear_cart` instead of calling remove_from_cart repeatedly.
-    8. If CURRENT CART is empty and the user asks to remove something, tell them honestly that their cart is already empty rather than calling a tool.
+    4. If the user asks to buy or add an item to their cart, call `add_to_cart` with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn.
+    5. If the user asks to remove one specific item, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" from CURRENT CART - never invent an id.
+    6. If the user asks to remove several items, call `remove_from_cart` once per item.
+    7. If the user asks to clear, empty, or remove everything, call `clear_cart` instead of calling remove_from_cart repeatedly.
+    8. If CURRENT CART is empty and the user asks to remove something, tell them honestly rather than calling a tool.
     9. You must ONLY output strictly formatted JSON matching this exact structure:
     {{
         "reply": "Your conversational reply...",
@@ -242,11 +245,20 @@ def run_agent(
     add_to_cart_tool, remove_from_cart_tool, clear_cart_tool = make_cart_tools(
         trace, cart_actions, cart_removals, cart_cleared
     )
-    agent_config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=0.3,
-        tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
-    )
+
+    # Gemini 3.x performs best with default sampling - Google's own guidance advises
+    # against overriding temperature for this generation, unlike 2.5.
+    if model_name == "gemini-3.5-flash":
+        agent_config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
+        )
+    else:
+        agent_config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.3,
+            tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
+        )
 
     user_parts = []
     if image_part:
@@ -256,9 +268,9 @@ def run_agent(
     contents = [types.Content(role="user", parts=user_parts)]
 
     try:
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling Gemini 2.5 Flash...")
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
         response = client.models.generate_content(
-            model="gemini-2.5-flash", contents=contents, config=agent_config
+            model=model_name, contents=contents, config=agent_config
         )
 
         if response.function_calls:
@@ -283,7 +295,7 @@ def run_agent(
 
             trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Returning tool output for final synthesis...")
             response = client.models.generate_content(
-                model="gemini-2.5-flash", contents=contents, config=agent_config
+                model=model_name, contents=contents, config=agent_config
             )
 
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
