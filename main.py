@@ -40,6 +40,27 @@ store_policies = {
 
 
 # ==========================================
+# RESILIENCE: shared retry wrapper for every direct Gemini call
+# 503 = Google's servers temporarily overloaded, genuinely worth one retry.
+# 429/other errors are not retried - retrying an exhausted quota just wastes time.
+# ==========================================
+def generate_with_retry(model: str, contents: list, config, trace: list, max_retries: int = 1):
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except Exception as e:
+            last_error = e
+            is_transient = "503" in str(e) or "UNAVAILABLE" in str(e)
+            if is_transient and attempt < max_retries:
+                trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: {model} temporarily overloaded, retrying...")
+                time.sleep(2)
+                continue
+            raise last_error
+    raise last_error
+
+
+# ==========================================
 # CATALOG: PostgreSQL, with local JSON fallback
 # ==========================================
 def load_catalog_from_db() -> list:
@@ -97,7 +118,7 @@ except Exception as e:
 
 
 # ==========================================
-# GOVERNANCE: PII + HITL
+# GOVERNANCE: PII
 # ==========================================
 @observe(as_type="span", name="PII_Scrubber")
 def scrub_pii(text: str, trace: list) -> str:
@@ -109,14 +130,72 @@ def scrub_pii(text: str, trace: list) -> str:
     return scrubbed
 
 
+# ==========================================
+# AGENT: INTENT ROUTER
+# ==========================================
 @observe(as_type="span", name="Intent_Router")
 def check_hitl_escalation(text: str, trace: list) -> bool:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Router: Evaluating intent for HITL escalation...")
+
     keywords = ["refund", "fraud", "lawsuit", "sue", "manager"]
     if any(k in text.lower() for k in keywords):
         trace.append(f"[{time.strftime('%H:%M:%S')}] Router: High-risk keyword detected. Escalating to HITL.")
         return True
-    return False
+
+    try:
+        router_config = types.GenerateContentConfig(
+            system_instruction=(
+                "You are an intent classifier for a retail support system. Decide if this "
+                "message needs escalation to a human agent - genuine anger, threats, legal "
+                "language, fraud concerns, or serious complaints. Ordinary questions about "
+                "products, sizing, or shipping are NOT escalations, even if mildly frustrated. "
+                "Respond with exactly one word: ESCALATE or CONTINUE."
+            ),
+        )
+        response = generate_with_retry(
+            "gemini-2.5-flash",
+            [types.Content(role="user", parts=[types.Part.from_text(text=text)])],
+            router_config, trace,
+        )
+        decision = response.text.strip().upper()
+        should_escalate = "ESCALATE" in decision
+        trace.append(
+            f"[{time.strftime('%H:%M:%S')}] Router: LLM classification - {decision}."
+            + (" Escalating to HITL." if should_escalate else " Proceeding normally.")
+        )
+        return should_escalate
+    except Exception as e:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Router: LLM check failed ({type(e).__name__}) - proceeding normally.")
+        return False
+
+
+# ==========================================
+# AGENT: VISION SPECIALIST
+# ==========================================
+@observe(as_type="span", name="Vision_Agent")
+def run_vision_agent(image_part: types.Part, trace: list) -> str | None:
+    trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: Analyzing uploaded image...")
+    try:
+        vision_config = types.GenerateContentConfig(
+            system_instruction=(
+                "You are a visual product analyst for an athletic footwear retailer. "
+                "Examine the image and describe the shoe's visual characteristics in plain text: "
+                "silhouette/style, colorway, notable design features, and which category it most "
+                "resembles (running, trail, track, lifestyle). Do not recommend products or make "
+                "purchasing suggestions - only describe what you observe, in 2-3 sentences."
+            ),
+        )
+        response = generate_with_retry(
+            "gemini-2.5-flash",
+            [types.Content(role="user", parts=[image_part])],
+            vision_config, trace,
+        )
+        description = response.text.strip()
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent output: {description}")
+        return description
+    except Exception as e:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: failed ({type(e).__name__}) - continuing on text alone.")
+        return None
 
 
 # ==========================================
@@ -157,13 +236,39 @@ def find_shoe_by_id(shoe_id: int) -> dict | None:
 
 
 # ==========================================
+# AGENT: OUTPUT VALIDATOR
+# ==========================================
+@observe(as_type="span", name="Output_Validation_Agent")
+def validate_output(reply_text: str, relevant_shoes: list, trace: list) -> tuple[bool, str]:
+    trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: Checking reply grounding...")
+    valid_names = [s["model"] for s in relevant_shoes]
+
+    validator_config = types.GenerateContentConfig(
+        system_instruction=(
+            "You are a strict output validator for a retail assistant. You will be given "
+            "a draft reply and a list of the ONLY valid product names it's allowed to mention. "
+            "Respond with exactly one word: PASS if the reply only references those products "
+            "(or mentions none by name), or FAIL if it names any product not in that list."
+        ),
+    )
+    check_prompt = f"VALID PRODUCTS: {json.dumps(valid_names)}\n\nDRAFT REPLY: {reply_text}"
+    response = generate_with_retry(
+        "gemini-2.5-flash",
+        [types.Content(role="user", parts=[types.Part.from_text(text=check_prompt)])],
+        validator_config, trace,
+    )
+    verdict = response.text.strip().upper()
+    passed = "PASS" in verdict
+    trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: {verdict}.")
+    return passed, verdict
+
+
+# ==========================================
 # TOOL CALLING (scoped per-request, not global)
 # ==========================================
 def make_cart_tools(trace: list, cart_actions: list, cart_removals: list, cart_cleared: list):
     @observe(as_type="span", name="Tool_Execution")
     def add_to_cart(shoe_id: int) -> str:
-        """Add an item to cart, identified ONLY by its numeric id from RETRIEVED INVENTORY.
-        Name and price are looked up from PostgreSQL directly - never taken from the model."""
         matched = find_shoe_by_id(shoe_id)
         if not matched:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Error: add_to_cart called with unknown shoe_id {shoe_id}.")
@@ -177,14 +282,12 @@ def make_cart_tools(trace: list, cart_actions: list, cart_removals: list, cart_c
 
     @observe(as_type="span", name="Tool_Execution")
     def remove_from_cart(item_id: str) -> str:
-        """Remove one specific item from the cart, identified by its exact id from CURRENT CART."""
         cart_removals.append(item_id)
         trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: remove_from_cart('{item_id}')")
         return f"Success: Removed item {item_id} from cart."
 
     @observe(as_type="span", name="Tool_Execution")
     def clear_cart() -> str:
-        """Remove every item from the cart in one action."""
         cart_cleared.append(True)
         trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: clear_cart()")
         return "Success: Cart cleared."
@@ -193,7 +296,7 @@ def make_cart_tools(trace: list, cart_actions: list, cart_removals: list, cart_c
 
 
 # ==========================================
-# MAIN ORCHESTRATOR
+# AGENT: CONCIERGE / REASONING
 # ==========================================
 @observe(name="Veloxa_Agent_Flow")
 def run_agent(
@@ -206,72 +309,85 @@ def run_agent(
     cart_cleared: list,
     image_part: types.Part | None = None,
 ) -> dict:
-    search_query = build_search_query(safe_text, history)
-    relevant_shoes = retrieve_relevant_shoes(search_query, trace)
-
-    # Value-based routing: a premium item in the mix earns the stronger model
-    is_premium = any(shoe.get("financial_tier") == "Premium" for shoe in relevant_shoes)
-    model_name = "gemini-3.5-flash" if is_premium else "gemini-2.5-flash"
-    get_client().update_current_span(metadata={"model_tier": "premium" if is_premium else "commodity"})
-    trace.append(
-        f"[{time.strftime('%H:%M:%S')}] Router: "
-        f"{'Premium item detected' if is_premium else 'Commodity-only query'} - routing to {model_name}."
-    )
-
-    history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
-    system_instruction = f"""
-    You are the VELOXA AI Concierge - an enterprise omnichannel shopping assistant.
-    RETRIEVED INVENTORY: {json.dumps(relevant_shoes)}
-    CURRENT CART: {json.dumps(current_cart)}
-    STORE POLICIES: {json.dumps(store_policies)}
-
-    DIRECTIVES:
-    1. If the user provides an image, use Visual Search to find the closest match in RETRIEVED INVENTORY.
-    2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe from HISTORY - never ask them to repeat information they already gave you.
-    3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
-    4. If the user asks to buy or add an item to their cart, call `add_to_cart` with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn.
-    5. If the user asks to remove one specific item, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" from CURRENT CART - never invent an id.
-    6. If the user asks to remove several items, call `remove_from_cart` once per item.
-    7. If the user asks to clear, empty, or remove everything, call `clear_cart` instead of calling remove_from_cart repeatedly.
-    8. If CURRENT CART is empty and the user asks to remove something, tell them honestly rather than calling a tool.
-    9. You must ONLY output strictly formatted JSON matching this exact structure:
-    {{
-        "reply": "Your conversational reply...",
-        "recommendations": [{{"id": 1, "match_percentage": 95, "reason": "Why it fits.", "recommended_color": "Red"}}]
-    }}
-    Do NOT wrap the response in markdown code blocks. Output raw JSON.
-    """
-
-    add_to_cart_tool, remove_from_cart_tool, clear_cart_tool = make_cart_tools(
-        trace, cart_actions, cart_removals, cart_cleared
-    )
-
-    # Gemini 3.x performs best with default sampling - Google's own guidance advises
-    # against overriding temperature for this generation, unlike 2.5.
-    if model_name == "gemini-3.5-flash":
-        agent_config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
-        )
-    else:
-        agent_config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.3,
-            tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
-        )
-
-    user_parts = []
-    if image_part:
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Vision: Processing multimodal image input...")
-        user_parts.append(image_part)
-    user_parts.append(types.Part.from_text(text=f"HISTORY:\n{history_str}\nUSER: {safe_text}"))
-    contents = [types.Content(role="user", parts=user_parts)]
-
     try:
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
-        response = client.models.generate_content(
-            model=model_name, contents=contents, config=agent_config
+        vision_description = None
+        if image_part:
+            vision_description = run_vision_agent(image_part, trace)
+
+        search_query = build_search_query(vision_description or safe_text, history)
+        relevant_shoes = retrieve_relevant_shoes(search_query, trace)
+
+        is_premium = any(shoe.get("financial_tier") == "Premium" for shoe in relevant_shoes)
+        is_complex = image_part is not None
+        model_name = "gemini-3.5-flash" if (is_premium or is_complex) else "gemini-2.5-flash"
+
+        if is_premium and is_complex:
+            route_reason = "Premium item + image analysis"
+        elif is_premium:
+            route_reason = "Premium item detected"
+        elif is_complex:
+            route_reason = "Complex (multimodal) query"
+        else:
+            route_reason = "Commodity, text-only query"
+
+        get_client().update_current_span(metadata={
+            "model_tier": "premium" if is_premium else "commodity",
+            "complexity": "high" if is_complex else "standard",
+        })
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Router: {route_reason} - routing to {model_name}.")
+
+        history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
+        image_context = f"\n    IMAGE ANALYSIS FROM VISION AGENT: {vision_description}" if vision_description else ""
+
+        system_instruction = f"""
+        You are the VELOXA AI Concierge - an enterprise omnichannel shopping assistant.
+        RETRIEVED INVENTORY: {json.dumps(relevant_shoes)}
+        CURRENT CART: {json.dumps(current_cart)}
+        STORE POLICIES: {json.dumps(store_policies)}
+        {image_context}
+
+        DIRECTIVES:
+        1. If IMAGE ANALYSIS is present, you are not shown the photo directly - rely on that analysis to identify the closest match in RETRIEVED INVENTORY.
+        2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe from HISTORY - never ask them to repeat information they already gave you.
+        3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
+        4. If the user asks to buy or add an item to their cart, call `add_to_cart` with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn.
+        5. If the user asks to remove one specific item, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" from CURRENT CART - never invent an id.
+        6. If the user asks to remove several items, call `remove_from_cart` once per item.
+        7. If the user asks to clear, empty, or remove everything, call `clear_cart` instead of calling remove_from_cart repeatedly.
+        8. If CURRENT CART is empty and the user asks to remove something, tell them honestly rather than calling a tool.
+        9. You must ONLY output strictly formatted JSON matching this exact structure:
+        {{
+            "reply": "Your conversational reply...",
+            "recommendations": [{{"id": 1, "match_percentage": 95, "reason": "Why it fits.", "recommended_color": "Red"}}]
+        }}
+        Do NOT wrap the response in markdown code blocks. Output raw JSON.
+        """
+
+        add_to_cart_tool, remove_from_cart_tool, clear_cart_tool = make_cart_tools(
+            trace, cart_actions, cart_removals, cart_cleared
         )
+
+        if model_name == "gemini-3.5-flash":
+            agent_config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
+            )
+        else:
+            agent_config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.3,
+                tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
+            )
+
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=f"HISTORY:\n{history_str}\nUSER: {safe_text}")],
+            )
+        ]
+
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
+        response = generate_with_retry(model_name, contents, agent_config, trace)
 
         if response.function_calls:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Agent: Tool execution requested.")
@@ -294,13 +410,21 @@ def run_agent(
             contents.append(types.Content(role="user", parts=tool_responses))
 
             trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Returning tool output for final synthesis...")
-            response = client.models.generate_content(
-                model=model_name, contents=contents, config=agent_config
-            )
+            response = generate_with_retry(model_name, contents, agent_config, trace)
 
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
         trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Successfully parsed JSON response.")
+
+        try:
+            passed, verdict = validate_output(data.get("reply", ""), relevant_shoes, trace)
+            if not passed:
+                trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: BLOCKED - replacing with safe fallback.")
+                data["reply"] = "I want to make sure I give you fully accurate information on that - let me confirm the details and follow up shortly."
+                data["recommendations"] = []
+        except Exception as e:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: check failed ({type(e).__name__}) - showing reply unvalidated.")
+
         return data
 
     except json.JSONDecodeError:
@@ -308,7 +432,7 @@ def run_agent(
         return {"reply": "I encountered an error structuring my response.", "recommendations": []}
 
     except Exception as e:
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Error: Gemini request failed - {type(e).__name__}: {e}")
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Error: Request failed - {type(e).__name__}: {e}")
         return {
             "reply": "I'm experiencing high demand right now and couldn't process that. Please try again in a moment.",
             "recommendations": [],
