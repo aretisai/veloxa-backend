@@ -122,10 +122,13 @@ def load_catalog_from_db() -> list:
     return result
 
 
+CATALOG_SOURCE = "PostgreSQL"
+
 try:
     catalog = load_catalog_from_db()
     print(f"Loaded {len(catalog)} shoes from PostgreSQL.")
 except Exception as e:
+    CATALOG_SOURCE = "local JSON (Postgres fallback)"
     print(f"Postgres load failed ({e}) - falling back to local JSON.")
     with open("veloxa_enhanced_catalog.json", "r") as f:
         catalog = json.load(f).get("catalog", [])
@@ -222,6 +225,7 @@ def build_search_query(safe_text: str, history: list) -> str:
 
 @observe(as_type="span", name="Vector_Retrieval")
 def retrieve_relevant_shoes(query: str, trace: list) -> list:
+    trace.append(f"[{time.strftime('%H:%M:%S')}] Data Source: Serving catalog from {CATALOG_SOURCE}.")
     trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Querying Vector DB...")
     query_emb = client.models.embed_content(model="gemini-embedding-001", contents=query)
     search_results = index.query(vector=query_emb.embeddings[0].values, top_k=15, include_metadata=True)
