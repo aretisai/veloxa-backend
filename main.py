@@ -510,6 +510,7 @@ def admin_metrics():
         "avg_response_seconds": None,
         "escalations": None,
         "tool_calls": None,
+        "total_cost_usd": None,
         "error": None,
     }
 
@@ -519,6 +520,7 @@ def admin_metrics():
             "metrics": [
                 {"measure": "count", "aggregation": "count"},
                 {"measure": "latency", "aggregation": "avg"},
+                {"measure": "totalCost", "aggregation": "sum"},
             ],
             "dimensions": [{"field": "name"}],
             "filters": [],
@@ -536,6 +538,9 @@ def admin_metrics():
 
         if "Tool_Execution" in by_name:
             result["tool_calls"] = int(by_name["Tool_Execution"].get("count_count", 0))
+
+        total_cost = sum(float(row.get("sum_totalCost", 0) or 0) for row in data)
+        result["total_cost_usd"] = round(total_cost, 4)
 
     except Exception as e:
         result["error"] = f"overview query failed: {type(e).__name__}: {e}"
