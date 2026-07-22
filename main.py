@@ -48,7 +48,21 @@ def generate_with_retry(model: str, contents: list, config, trace: list, max_ret
     last_error = None
     for attempt in range(max_retries + 1):
         try:
-            return client.models.generate_content(model=model, contents=contents, config=config)
+            response = client.models.generate_content(model=model, contents=contents, config=config)
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                try:
+                    get_client().update_current_generation(
+                        model=model,
+                        usage_details={
+                            "input": usage.prompt_token_count,
+                            "output": usage.candidates_token_count,
+                            "total": usage.total_token_count,
+                        },
+                    )
+                except Exception:
+                    pass  # telemetry reporting should never break the actual response
+            return response
         except Exception as e:
             last_error = e
             is_transient = "503" in str(e) or "UNAVAILABLE" in str(e)
@@ -133,7 +147,7 @@ def scrub_pii(text: str, trace: list) -> str:
 # ==========================================
 # AGENT: INTENT ROUTER
 # ==========================================
-@observe(as_type="span", name="Intent_Router")
+@observe(as_type="generation", name="Intent_Router")
 def check_hitl_escalation(text: str, trace: list) -> bool:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Router: Evaluating intent for HITL escalation...")
 
@@ -172,7 +186,7 @@ def check_hitl_escalation(text: str, trace: list) -> bool:
 # ==========================================
 # AGENT: VISION SPECIALIST
 # ==========================================
-@observe(as_type="span", name="Vision_Agent")
+@observe(as_type="generation", name="Vision_Agent")
 def run_vision_agent(image_part: types.Part, trace: list) -> str | None:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: Analyzing uploaded image...")
     try:
@@ -235,10 +249,37 @@ def find_shoe_by_id(shoe_id: int) -> dict | None:
     return next((s for s in catalog if s["id"] == shoe_id), None)
 
 
+@observe(as_type="generation", name="Concierge_Generation")
+def call_concierge_model(model_name: str, contents: list, config, trace: list):
+    return generate_with_retry(model_name, contents, config, trace)
+
+
+def compact_for_prompt(shoes: list) -> list:
+    """Same stock/price fidelity, without repeating the image path once per size row."""
+    compact = []
+    for shoe in shoes:
+        stock: dict = {}
+        for item in shoe["inventory"]:
+            stock.setdefault(item["color"], {})[item["size"]] = item["stock"]
+        compact.append({
+            "id": shoe["id"],
+            "model": shoe["model"],
+            "category": shoe["category"],
+            "price": shoe["price"],
+            "sale_price": shoe["finalPrice"],
+            "on_sale": shoe["price"] != shoe["finalPrice"],
+            "financial_tier": shoe.get("financial_tier"),
+            "colors": shoe["colors_available"],
+            "stock_by_color_and_size": stock,
+            "specs": shoe.get("performance_specs", {}),
+        })
+    return compact
+
+
 # ==========================================
 # AGENT: OUTPUT VALIDATOR
 # ==========================================
-@observe(as_type="span", name="Output_Validation_Agent")
+@observe(as_type="generation", name="Output_Validation_Agent")
 def validate_output(reply_text: str, relevant_shoes: list, trace: list) -> tuple[bool, str]:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: Checking reply grounding...")
     valid_names = [s["model"] for s in relevant_shoes]
@@ -335,13 +376,14 @@ def run_agent(
             "complexity": "high" if is_complex else "standard",
         })
         trace.append(f"[{time.strftime('%H:%M:%S')}] Router: {route_reason} - routing to {model_name}.")
+        compact_shoes = compact_for_prompt(relevant_shoes)
 
         history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
         image_context = f"\n    IMAGE ANALYSIS FROM VISION AGENT: {vision_description}" if vision_description else ""
 
         system_instruction = f"""
         You are the VELOXA AI Concierge - an enterprise omnichannel shopping assistant.
-        RETRIEVED INVENTORY: {json.dumps(relevant_shoes)}
+        RETRIEVED INVENTORY: {json.dumps(compact_shoes)}
         CURRENT CART: {json.dumps(current_cart)}
         STORE POLICIES: {json.dumps(store_policies)}
         {image_context}
@@ -387,7 +429,7 @@ def run_agent(
         ]
 
         trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
-        response = generate_with_retry(model_name, contents, agent_config, trace)
+        response = call_concierge_model(model_name, contents, agent_config, trace)
 
         if response.function_calls:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Agent: Tool execution requested.")
@@ -410,7 +452,7 @@ def run_agent(
             contents.append(types.Content(role="user", parts=tool_responses))
 
             trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Returning tool output for final synthesis...")
-            response = generate_with_retry(model_name, contents, agent_config, trace)
+            response = call_concierge_model(model_name, contents, agent_config, trace)
 
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
