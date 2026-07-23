@@ -38,11 +38,56 @@ store_policies = {
     "exchanges": "Free size and color exchanges within 30 days.",
 }
 
+# Fallback only - used if Langfuse is unreachable when fetching the live prompt.
+# Kept as an exact match of the production version so behavior never silently changes.
+FALLBACK_CONCIERGE_PROMPT = """You are the VELOXA AI Concierge - an enterprise omnichannel shopping assistant.
+RETRIEVED INVENTORY: {{retrieved_inventory}}
+CURRENT CART: {{current_cart}}
+STORE POLICIES: {{store_policies}}
+{{image_context}}
+
+DIRECTIVES:
+1. If IMAGE ANALYSIS is present, you are not shown the photo directly - rely on that analysis to identify the closest match in RETRIEVED INVENTORY.
+2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe from HISTORY - never ask them to repeat information they already gave you.
+3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
+4. If the user asks to buy or add an item to their cart, call `add_to_cart` with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn.
+5. If the user asks to remove one specific item, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" from CURRENT CART - never invent an id.
+6. If the user asks to remove several items, call `remove_from_cart` once per item.
+7. If the user asks to clear, empty, or remove everything, call `clear_cart` instead of calling remove_from_cart repeatedly.
+8. If CURRENT CART is empty and the user asks to remove something, tell them honestly rather than calling a tool.
+9. You must ONLY output strictly formatted JSON matching this exact structure:
+{
+    "reply": "Your conversational reply...",
+    "recommendations": [{"id": 1, "match_percentage": 95, "reason": "Why it fits.", "recommended_color": "Red"}]
+}
+Do NOT wrap the response in markdown code blocks. Output raw JSON."""
+
+FALLBACK_INTENT_ROUTER_PROMPT = (
+    "You are an intent classifier for a retail support system. Decide if this "
+    "message needs escalation to a human agent - genuine anger, threats, legal "
+    "language, fraud concerns, or serious complaints. Ordinary questions about "
+    "products, sizing, or shipping are NOT escalations, even if mildly frustrated. "
+    "Respond with exactly one word: ESCALATE or CONTINUE."
+)
+
+FALLBACK_VISION_AGENT_PROMPT = (
+    "You are a visual product analyst for an athletic footwear retailer. "
+    "Examine the image and describe the shoe's visual characteristics in plain text: "
+    "silhouette/style, colorway, notable design features, and which category it most "
+    "resembles (running, trail, track, lifestyle). Do not recommend products or make "
+    "purchasing suggestions - only describe what you observe, in 2-3 sentences."
+)
+
+FALLBACK_OUTPUT_VALIDATOR_PROMPT = (
+    "You are a strict output validator for a retail assistant. You will be given "
+    "a draft reply and a list of the ONLY valid product names it's allowed to mention. "
+    "Respond with exactly one word: PASS if the reply only references those products "
+    "(or mentions none by name), or FAIL if it names any product not in that list."
+)
+
 
 # ==========================================
 # RESILIENCE: shared retry wrapper for every direct Gemini call
-# 503 = Google's servers temporarily overloaded, genuinely worth one retry.
-# 429/other errors are not retried - retrying an exhausted quota just wastes time.
 # ==========================================
 def generate_with_retry(model: str, contents: list, config, trace: list, max_retries: int = 1):
     last_error = None
@@ -61,7 +106,7 @@ def generate_with_retry(model: str, contents: list, config, trace: list, max_ret
                         },
                     )
                 except Exception:
-                    pass  # telemetry reporting should never break the actual response
+                    pass
             return response
         except Exception as e:
             last_error = e
@@ -160,15 +205,12 @@ def check_hitl_escalation(text: str, trace: list) -> bool:
         return True
 
     try:
-        router_config = types.GenerateContentConfig(
-            system_instruction=(
-                "You are an intent classifier for a retail support system. Decide if this "
-                "message needs escalation to a human agent - genuine anger, threats, legal "
-                "language, fraud concerns, or serious complaints. Ordinary questions about "
-                "products, sizing, or shipping are NOT escalations, even if mildly frustrated. "
-                "Respond with exactly one word: ESCALATE or CONTINUE."
-            ),
-        )
+        prompt = get_client().get_prompt("veloxa-intent-router", fallback=FALLBACK_INTENT_ROUTER_PROMPT)
+        try:
+            get_client().update_current_generation(prompt=prompt)
+        except Exception:
+            pass
+        router_config = types.GenerateContentConfig(system_instruction=prompt.compile())
         response = generate_with_retry(
             "gemini-2.5-flash",
             [types.Content(role="user", parts=[types.Part.from_text(text=text)])],
@@ -193,15 +235,12 @@ def check_hitl_escalation(text: str, trace: list) -> bool:
 def run_vision_agent(image_part: types.Part, trace: list) -> str | None:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: Analyzing uploaded image...")
     try:
-        vision_config = types.GenerateContentConfig(
-            system_instruction=(
-                "You are a visual product analyst for an athletic footwear retailer. "
-                "Examine the image and describe the shoe's visual characteristics in plain text: "
-                "silhouette/style, colorway, notable design features, and which category it most "
-                "resembles (running, trail, track, lifestyle). Do not recommend products or make "
-                "purchasing suggestions - only describe what you observe, in 2-3 sentences."
-            ),
-        )
+        prompt = get_client().get_prompt("veloxa-vision-agent", fallback=FALLBACK_VISION_AGENT_PROMPT)
+        try:
+            get_client().update_current_generation(prompt=prompt)
+        except Exception:
+            pass
+        vision_config = types.GenerateContentConfig(system_instruction=prompt.compile())
         response = generate_with_retry(
             "gemini-2.5-flash",
             [types.Content(role="user", parts=[image_part])],
@@ -254,7 +293,12 @@ def find_shoe_by_id(shoe_id: int) -> dict | None:
 
 
 @observe(as_type="generation", name="Concierge_Generation")
-def call_concierge_model(model_name: str, contents: list, config, trace: list):
+def call_concierge_model(model_name: str, contents: list, config, trace: list, prompt=None):
+    if prompt:
+        try:
+            get_client().update_current_generation(prompt=prompt)
+        except Exception:
+            pass
     return generate_with_retry(model_name, contents, config, trace)
 
 
@@ -288,14 +332,12 @@ def validate_output(reply_text: str, relevant_shoes: list, trace: list) -> tuple
     trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: Checking reply grounding...")
     valid_names = [s["model"] for s in relevant_shoes]
 
-    validator_config = types.GenerateContentConfig(
-        system_instruction=(
-            "You are a strict output validator for a retail assistant. You will be given "
-            "a draft reply and a list of the ONLY valid product names it's allowed to mention. "
-            "Respond with exactly one word: PASS if the reply only references those products "
-            "(or mentions none by name), or FAIL if it names any product not in that list."
-        ),
-    )
+    prompt = get_client().get_prompt("veloxa-output-validator", fallback=FALLBACK_OUTPUT_VALIDATOR_PROMPT)
+    try:
+        get_client().update_current_generation(prompt=prompt)
+    except Exception:
+        pass
+    validator_config = types.GenerateContentConfig(system_instruction=prompt.compile())
     check_prompt = f"VALID PRODUCTS: {json.dumps(valid_names)}\n\nDRAFT REPLY: {reply_text}"
     response = generate_with_retry(
         "gemini-2.5-flash",
@@ -383,31 +425,15 @@ def run_agent(
         compact_shoes = compact_for_prompt(relevant_shoes)
 
         history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
-        image_context = f"\n    IMAGE ANALYSIS FROM VISION AGENT: {vision_description}" if vision_description else ""
+        image_context = f"IMAGE ANALYSIS FROM VISION AGENT: {vision_description}" if vision_description else ""
 
-        system_instruction = f"""
-        You are the VELOXA AI Concierge - an enterprise omnichannel shopping assistant.
-        RETRIEVED INVENTORY: {json.dumps(compact_shoes)}
-        CURRENT CART: {json.dumps(current_cart)}
-        STORE POLICIES: {json.dumps(store_policies)}
-        {image_context}
-
-        DIRECTIVES:
-        1. If IMAGE ANALYSIS is present, you are not shown the photo directly - rely on that analysis to identify the closest match in RETRIEVED INVENTORY.
-        2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe from HISTORY - never ask them to repeat information they already gave you.
-        3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
-        4. If the user asks to buy or add an item to their cart, call `add_to_cart` with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn.
-        5. If the user asks to remove one specific item, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" from CURRENT CART - never invent an id.
-        6. If the user asks to remove several items, call `remove_from_cart` once per item.
-        7. If the user asks to clear, empty, or remove everything, call `clear_cart` instead of calling remove_from_cart repeatedly.
-        8. If CURRENT CART is empty and the user asks to remove something, tell them honestly rather than calling a tool.
-        9. You must ONLY output strictly formatted JSON matching this exact structure:
-        {{
-            "reply": "Your conversational reply...",
-            "recommendations": [{{"id": 1, "match_percentage": 95, "reason": "Why it fits.", "recommended_color": "Red"}}]
-        }}
-        Do NOT wrap the response in markdown code blocks. Output raw JSON.
-        """
+        prompt = get_client().get_prompt("veloxa-concierge-system", fallback=FALLBACK_CONCIERGE_PROMPT)
+        system_instruction = prompt.compile(
+            retrieved_inventory=json.dumps(compact_shoes),
+            current_cart=json.dumps(current_cart),
+            store_policies=json.dumps(store_policies),
+            image_context=image_context,
+        )
 
         add_to_cart_tool, remove_from_cart_tool, clear_cart_tool = make_cart_tools(
             trace, cart_actions, cart_removals, cart_cleared
@@ -433,7 +459,7 @@ def run_agent(
         ]
 
         trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
-        response = call_concierge_model(model_name, contents, agent_config, trace)
+        response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
 
         if response.function_calls:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Agent: Tool execution requested.")
@@ -456,7 +482,7 @@ def run_agent(
             contents.append(types.Content(role="user", parts=tool_responses))
 
             trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Returning tool output for final synthesis...")
-            response = call_concierge_model(model_name, contents, agent_config, trace)
+            response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
 
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
