@@ -55,7 +55,7 @@ STORE POLICIES: {{store_policies}}
 DIRECTIVES:
 1. If IMAGE ANALYSIS is present, you are not shown the photo directly - rely on that analysis to identify the closest match in RETRIEVED INVENTORY.
 2. If the user's message is a short follow-up (e.g. "add it", "yes", "that one") referring to a shoe already discussed in HISTORY, use the exact shoe from HISTORY - never ask them to repeat information they already gave you.
-3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If nothing there fits, say so honestly.
+3. Only recommend items from RETRIEVED INVENTORY for new product suggestions. If the user asks about a specific product by name and that exact name does not appear in RETRIEVED INVENTORY, do not assume it exists or answer as if you have details about it - tell them directly and honestly that you don't carry that specific item, then proactively suggest similar alternatives from RETRIEVED INVENTORY so they're not left without options.
 4. If the user asks to buy or add an item to their cart, call `add_to_cart` with that shoe's numeric "id" field from RETRIEVED INVENTORY - never pass a name or price, only the id. Only say an item was added if you actually called the tool this turn.
 5. If the user asks to remove one specific item, find the best-matching item in CURRENT CART by name and call `remove_from_cart` with that exact item's "id" from CURRENT CART - never invent an id.
 6. If the user asks to remove several items, call `remove_from_cart` once per item.
@@ -74,10 +74,14 @@ FALLBACK_INTENT_ROUTER_PROMPT = (
     "message needs escalation to a human agent - genuine anger, threats, legal "
     "language, fraud concerns, or serious complaints. Ordinary questions about "
     "products, sizing, or shipping are NOT escalations, even if mildly frustrated. "
-    "Mentioning a medical condition, injury, or physical discomfort as context for "
-    "a product question is NOT, by itself, grounds for escalation - only escalate "
-    "if that mention is combined with genuine anger, threats, legal language, or a "
-    "demand for compensation. Respond with exactly one word: ESCALATE or CONTINUE."
+    "A calm question about return, refund, or exchange eligibility - even if the "
+    "item was used or worn - is NOT an escalation by itself; only escalate if it "
+    "is combined with genuine anger, threats, legal language, or an explicit demand "
+    "rather than a question. Mentioning a medical condition, injury, or physical "
+    "discomfort as context for a product question is NOT, by itself, grounds for "
+    "escalation - only escalate if that mention is combined with genuine anger, "
+    "threats, legal language, or a demand for compensation. Respond with exactly "
+    "one word: ESCALATE or CONTINUE."
 )
 
 FALLBACK_VISION_AGENT_PROMPT = (
@@ -279,7 +283,7 @@ def scrub_pii(text: str, trace: list) -> str:
 def check_hitl_escalation(text: str, trace: list) -> bool:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Intent Router: Evaluating intent for HITL escalation...")
 
-    keywords = ["refund", "fraud", "lawsuit", "sue", "manager"]
+    keywords = ["fraud", "lawsuit", "sue"]
     if any(k in text.lower() for k in keywords):
         trace.append(f"[{time.strftime('%H:%M:%S')}] Intent Router: High-risk keyword detected. Escalating to HITL.")
         return True
@@ -661,22 +665,25 @@ def run_agent(
             passed, verdict = validate_output(data.get("reply", ""), relevant_shoes, trace)
             if not passed:
                 trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: BLOCKED - replacing with safe fallback.")
-                data["reply"] = "I want to make sure I give you fully accurate information on that - let me confirm the details and follow up shortly."
+                data["reply"] = "I couldn't find that as one of our current products - could you double-check the name, or would you like me to suggest similar options from what we actually carry?"
                 data["recommendations"] = []
+                data["cacheable"] = False
         except Exception as e:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: check failed ({type(e).__name__}) - showing reply unvalidated.")
+            data["cacheable"] = False
 
         return data
 
     except json.JSONDecodeError:
         trace.append(f"[{time.strftime('%H:%M:%S')}] Error: Failed to parse JSON from LLM.")
-        return {"reply": "I encountered an error structuring my response.", "recommendations": []}
+        return {"reply": "I encountered an error structuring my response.", "recommendations": [], "cacheable": False}
 
     except Exception as e:
         trace.append(f"[{time.strftime('%H:%M:%S')}] Error: Request failed - {type(e).__name__}: {e}")
         return {
             "reply": "I'm experiencing high demand right now and couldn't process that. Please try again in a moment.",
             "recommendations": [],
+            "cacheable": False,
         }
 
 
@@ -819,7 +826,7 @@ def chat(request: ChatRequest):
             cart_actions, cart_removals, cart_cleared, image_part,
         )
 
-        if not image_part and not cart_actions and not cart_removals and not cart_cleared:
+        if not image_part and not cart_actions and not cart_removals and not cart_cleared and result.get("cacheable", True):
             store_in_cache(safe_text, {"reply": result.get("reply"), "recommendations": result.get("recommendations", [])}, trace)
 
         get_client().flush()
