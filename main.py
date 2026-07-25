@@ -60,14 +60,18 @@ DIRECTIVES:
     "reply": "Your conversational reply...",
     "recommendations": [{"id": 1, "match_percentage": 95, "reason": "Why it fits.", "recommended_color": "Red"}]
 }
-Do NOT wrap the response in markdown code blocks. Output raw JSON."""
+Do NOT wrap the response in markdown code blocks. Output raw JSON.
+10. If the user mentions a medical condition, injury, or health concern, you may discuss general product features relevant to comfort or support, but never diagnose, claim to treat, or claim to cure any condition. Include a brief note recommending they consult a healthcare professional for medical guidance."""
 
 FALLBACK_INTENT_ROUTER_PROMPT = (
     "You are an intent classifier for a retail support system. Decide if this "
     "message needs escalation to a human agent - genuine anger, threats, legal "
     "language, fraud concerns, or serious complaints. Ordinary questions about "
     "products, sizing, or shipping are NOT escalations, even if mildly frustrated. "
-    "Respond with exactly one word: ESCALATE or CONTINUE."
+    "Mentioning a medical condition, injury, or physical discomfort as context for "
+    "a product question is NOT, by itself, grounds for escalation - only escalate "
+    "if that mention is combined with genuine anger, threats, legal language, or a "
+    "demand for compensation. Respond with exactly one word: ESCALATE or CONTINUE."
 )
 
 FALLBACK_VISION_AGENT_PROMPT = (
@@ -83,6 +87,15 @@ FALLBACK_OUTPUT_VALIDATOR_PROMPT = (
     "a draft reply and a list of the ONLY valid product names it's allowed to mention. "
     "Respond with exactly one word: PASS if the reply only references those products "
     "(or mentions none by name), or FAIL if it names any product not in that list."
+)
+
+FALLBACK_COMPLEXITY_CLASSIFIER_PROMPT = (
+    "You are a query complexity classifier for a retail shopping assistant. "
+    "Decide whether this question requires genuine multi-step reasoning, technical "
+    "or domain expertise (e.g. biomechanics, injury considerations, technical "
+    "tradeoffs), or synthesizing multiple competing constraints - as opposed to a "
+    "simple, single-fact lookup a basic assistant could answer directly. "
+    "Respond with exactly one word: COMPLEX or SIMPLE."
 )
 
 
@@ -197,11 +210,11 @@ def scrub_pii(text: str, trace: list) -> str:
 # ==========================================
 @observe(as_type="generation", name="Intent_Router")
 def check_hitl_escalation(text: str, trace: list) -> bool:
-    trace.append(f"[{time.strftime('%H:%M:%S')}] Router: Evaluating intent for HITL escalation...")
+    trace.append(f"[{time.strftime('%H:%M:%S')}] Intent Router: Evaluating intent for HITL escalation...")
 
     keywords = ["refund", "fraud", "lawsuit", "sue", "manager"]
     if any(k in text.lower() for k in keywords):
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Router: High-risk keyword detected. Escalating to HITL.")
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Intent Router: High-risk keyword detected. Escalating to HITL.")
         return True
 
     try:
@@ -211,6 +224,7 @@ def check_hitl_escalation(text: str, trace: list) -> bool:
         except Exception:
             pass
         router_config = types.GenerateContentConfig(system_instruction=prompt.compile())
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Intent Router: Calling gemini-2.5-flash for classification...")
         response = generate_with_retry(
             "gemini-2.5-flash",
             [types.Content(role="user", parts=[types.Part.from_text(text=text)])],
@@ -219,12 +233,45 @@ def check_hitl_escalation(text: str, trace: list) -> bool:
         decision = response.text.strip().upper()
         should_escalate = "ESCALATE" in decision
         trace.append(
-            f"[{time.strftime('%H:%M:%S')}] Router: LLM classification - {decision}."
+            f"[{time.strftime('%H:%M:%S')}] Intent Router: LLM classification - {decision}."
             + (" Escalating to HITL." if should_escalate else " Proceeding normally.")
         )
         return should_escalate
     except Exception as e:
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Router: LLM check failed ({type(e).__name__}) - proceeding normally.")
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Intent Router: LLM check failed ({type(e).__name__}) - proceeding normally.")
+        return False
+
+
+# ==========================================
+# AGENT: COMPLEXITY CLASSIFIER
+# Only ever called when nothing else already justified Pro - closes the one gap
+# grounded signals structurally can't see: a hard reasoning question that names
+# no product and matches no tier.
+# ==========================================
+@observe(as_type="generation", name="Complexity_Classifier")
+def check_reasoning_complexity(text: str, trace: list) -> bool:
+    trace.append(f"[{time.strftime('%H:%M:%S')}] Complexity Classifier: No product/tier signal found - checking for genuine reasoning complexity...")
+    try:
+        prompt = get_client().get_prompt("veloxa-complexity-classifier", fallback=FALLBACK_COMPLEXITY_CLASSIFIER_PROMPT)
+        try:
+            get_client().update_current_generation(prompt=prompt)
+        except Exception:
+            pass
+        classifier_config = types.GenerateContentConfig(system_instruction=prompt.compile())
+        response = generate_with_retry(
+            "gemini-2.5-flash",
+            [types.Content(role="user", parts=[types.Part.from_text(text=text)])],
+            classifier_config, trace,
+        )
+        decision = response.text.strip().upper()
+        is_complex = "COMPLEX" in decision
+        trace.append(
+            f"[{time.strftime('%H:%M:%S')}] Complexity Classifier: {decision}."
+            + (" Escalating to Pro for deeper reasoning." if is_complex else " Standard reasoning is sufficient.")
+        )
+        return is_complex
+    except Exception as e:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Complexity Classifier: check failed ({type(e).__name__}) - defaulting to standard routing.")
         return False
 
 
@@ -263,7 +310,7 @@ def build_search_query(safe_text: str, history: list) -> str:
 
 
 @observe(as_type="span", name="Vector_Retrieval")
-def retrieve_relevant_shoes(query: str, trace: list) -> list:
+def retrieve_relevant_shoes(query: str, trace: list) -> tuple[list, list]:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Data Source: Serving catalog from {CATALOG_SOURCE}.")
     trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Querying Vector DB...")
     query_emb = client.models.embed_content(model="gemini-embedding-001", contents=query)
@@ -272,7 +319,7 @@ def retrieve_relevant_shoes(query: str, trace: list) -> list:
     matched_ids = [int(match["id"]) for match in search_results["matches"]]
     candidates = [shoe for shoe in catalog if shoe["id"] in matched_ids]
     if not candidates:
-        return []
+        return [], []
 
     documents = [
         f"{shoe['model']} - {shoe['category']} - ${shoe['finalPrice']} - Colors: {', '.join(shoe['colors_available'])}"
@@ -285,7 +332,10 @@ def retrieve_relevant_shoes(query: str, trace: list) -> list:
         top_n=min(4, len(documents)),
     )
     trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Retrieved and reranked {len(rerank_response.results)} items.")
-    return [candidates[r.index] for r in rerank_response.results]
+
+    ordered_shoes = [candidates[r.index] for r in rerank_response.results]
+    scores = [r.relevance_score for r in rerank_response.results]
+    return ordered_shoes, scores
 
 
 def find_shoe_by_id(shoe_id: int) -> dict | None:
@@ -402,26 +452,67 @@ def run_agent(
             vision_description = run_vision_agent(image_part, trace)
 
         search_query = build_search_query(vision_description or safe_text, history)
-        relevant_shoes = retrieve_relevant_shoes(search_query, trace)
+        relevant_shoes, relevance_scores = retrieve_relevant_shoes(search_query, trace)
 
-        is_premium = relevant_shoes[0].get("financial_tier") == "Premium" if relevant_shoes else False
-        is_complex = image_part is not None
-        model_name = "gemini-3.5-flash" if (is_premium or is_complex) else "gemini-2.5-flash"
+        # If the user's actual message directly names a retrieved product, that's a
+        # stronger signal than positional rank - conversation-history blending in the
+        # search query can push the actually-discussed product out of position #1.
+        directly_mentioned = next(
+            (s for s in relevant_shoes if s["model"].lower() in safe_text.lower()), None
+        )
 
-        if is_premium and is_complex:
-            route_reason = "Top match is Premium tier + image analysis"
-        elif is_premium:
-            route_reason = "Top match is Premium tier"
-        elif is_complex:
-            route_reason = "Complex (multimodal) query"
+        RELEVANCE_THRESHOLD = 0.4
+        COMPETITIVE_GAP_THRESHOLD = 0.05
+
+        if directly_mentioned:
+            routing_shoe = directly_mentioned
+            has_confident_match = True
         else:
-            route_reason = "Commodity, text-only query"
+            top_score = relevance_scores[0] if relevance_scores else 0.0
+            has_confident_match = bool(relevant_shoes) and top_score >= RELEVANCE_THRESHOLD
+            routing_shoe = relevant_shoes[0] if has_confident_match else None
+
+        score_gap = (relevance_scores[0] - relevance_scores[1]) if len(relevance_scores) > 1 else 1.0
+        is_competitive_match = (
+            has_confident_match and not directly_mentioned and score_gap < COMPETITIVE_GAP_THRESHOLD
+        )
+
+        is_premium = has_confident_match and routing_shoe is not None and routing_shoe.get("financial_tier") == "Premium"
+        is_image_complex = image_part is not None
+
+        # Only pay the extra latency of a dedicated check when nothing else has
+        # already earned Pro.
+        is_reasoning_complex = False
+        if not is_premium and not is_image_complex and not is_competitive_match:
+            is_reasoning_complex = check_reasoning_complexity(safe_text, trace)
+
+        is_complex = is_image_complex or is_competitive_match or is_reasoning_complex
+        model_name = "gemini-3.1-pro-preview" if (is_premium or is_complex) else "gemini-2.5-flash"
+
+        reasons = []
+        if directly_mentioned:
+            reasons.append(f"'{directly_mentioned['model']}' directly named")
+        if is_premium:
+            reasons.append("Premium tier")
+        if is_image_complex:
+            reasons.append("image analysis")
+        if is_competitive_match:
+            reasons.append(f"competitive match spread (gap {score_gap:.3f})")
+        if is_reasoning_complex:
+            reasons.append("genuine reasoning complexity")
+        route_reason = " + ".join(reasons) if reasons else "Commodity, single clear match"
 
         get_client().update_current_span(metadata={
             "model_tier": "premium" if is_premium else "commodity",
             "complexity": "high" if is_complex else "standard",
+            "direct_mention": bool(directly_mentioned),
+            "reasoning_complex": is_reasoning_complex,
+            "score_gap": round(score_gap, 3),
         })
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Router: {route_reason} - routing to {model_name}.")
+        trace.append(
+            f"[{time.strftime('%H:%M:%S')}] Model Router: {route_reason} "
+            f"(gap {score_gap:.3f}) - routing to {model_name}."
+        )
         compact_shoes = compact_for_prompt(relevant_shoes)
 
         history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
@@ -439,10 +530,11 @@ def run_agent(
             trace, cart_actions, cart_removals, cart_cleared
         )
 
-        if model_name == "gemini-3.5-flash":
+        if model_name == "gemini-3.1-pro-preview":
             agent_config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
+                thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
             )
         else:
             agent_config = types.GenerateContentConfig(

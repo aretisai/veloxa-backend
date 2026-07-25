@@ -72,4 +72,18 @@ langfuse.create_prompt(
     config={"model": "gemini-2.5-flash"},
 )
 
-print("All four prompts created and labeled production.")
+langfuse.create_prompt(
+    name="veloxa-complexity-classifier",
+    prompt=(
+        "You are a query complexity classifier for a retail shopping assistant. "
+        "Decide whether this question requires genuine multi-step reasoning, technical "
+        "or domain expertise (e.g. biomechanics, injury considerations, technical "
+        "tradeoffs), or synthesizing multiple competing constraints - as opposed to a "
+        "simple, single-fact lookup a basic assistant could answer directly. "
+        "Respond with exactly one word: COMPLEX or SIMPLE."
+    ),
+    labels=["production"],
+    config={"model": "gemini-2.5-flash"},
+)
+
+print("All five prompts created and labeled production.")
