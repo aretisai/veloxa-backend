@@ -23,6 +23,7 @@ fsspec==2026.6.0
 google-auth==2.55.2
 google-genai==2.12.1
 googleapis-common-protos==1.75.0
+grpcio==1.83.0
 h11==0.16.0
 h2==4.3.0
 hf-xet==1.5.2
@@ -39,6 +40,7 @@ markdown-it-py==4.2.0
 MarkupSafe==3.0.3
 mdurl==0.1.2
 msgspec==0.21.1
+numpy==2.5.1
 opentelemetry-api==1.44.0
 opentelemetry-exporter-otlp-proto-common==1.44.0
 opentelemetry-exporter-otlp-proto-http==1.44.0
@@ -48,6 +50,7 @@ opentelemetry-semantic-conventions==0.65b0
 orjson==3.11.9
 packaging==26.2
 pinecone==9.1.0
+portalocker==3.2.0
 protobuf==7.35.1
 psycopg2-binary==2.9.12
 pyasn1==0.6.4
@@ -60,7 +63,9 @@ pydantic_core==2.46.4
 Pygments==2.20.0
 python-dotenv==1.2.2
 python-multipart==0.0.32
+pywin32==312
 PyYAML==6.0.3
+qdrant-client==1.18.0
 requests==2.34.2
 rich==15.0.0
 rich-toolkit==0.20.3

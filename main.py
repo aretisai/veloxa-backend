@@ -16,6 +16,7 @@ from pinecone import Pinecone
 import cohere
 import psycopg2
 from upstash_redis import Redis as UpstashRedis
+from qdrant_client import QdrantClient
 from langfuse import observe, get_client, propagate_attributes
 
 load_dotenv()
@@ -34,6 +35,8 @@ pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index = pc.Index("veloxa-inventory")
 co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
 redis_client = UpstashRedis.from_env()
+qdrant = QdrantClient(url=os.getenv("QDRANT_URL"), api_key=os.getenv("QDRANT_API_KEY"))
+QDRANT_COLLECTION_NAME = "veloxa-inventory-qdrant"
 
 store_policies = {
     "shipping": "Free standard shipping on orders over $150. Expedited shipping is $25.",
@@ -378,9 +381,19 @@ def retrieve_relevant_shoes(query: str, trace: list) -> tuple[list, list]:
     trace.append(f"[{time.strftime('%H:%M:%S')}] Data Source: Serving catalog from {CATALOG_SOURCE}.")
     trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Querying Vector DB...")
     query_emb = client.models.embed_content(model="gemini-embedding-001", contents=query)
-    search_results = index.query(vector=query_emb.embeddings[0].values, top_k=15, include_metadata=True)
+    query_vector = query_emb.embeddings[0].values
 
-    matched_ids = [int(match["id"]) for match in search_results["matches"]]
+    try:
+        search_results = qdrant.query_points(
+            collection_name=QDRANT_COLLECTION_NAME, query=query_vector, limit=15
+        )
+        matched_ids = [int(point.id) for point in search_results.points]
+        trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Vector search served by Qdrant.")
+    except Exception as e:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] RAG: Qdrant query failed ({type(e).__name__}) - falling back to Pinecone.")
+        search_results = index.query(vector=query_vector, top_k=15, include_metadata=True)
+        matched_ids = [int(match["id"]) for match in search_results["matches"]]
+
     candidates = [shoe for shoe in catalog if shoe["id"] in matched_ids]
     if not candidates:
         return [], []
