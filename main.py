@@ -4,6 +4,7 @@ import time
 import re
 import uuid
 import base64
+import math
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,6 +15,7 @@ from google.genai import types
 from pinecone import Pinecone
 import cohere
 import psycopg2
+from upstash_redis import Redis as UpstashRedis
 from langfuse import observe, get_client, propagate_attributes
 
 load_dotenv()
@@ -31,6 +33,7 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 index = pc.Index("veloxa-inventory")
 co = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
+redis_client = UpstashRedis.from_env()
 
 store_policies = {
     "shipping": "Free standard shipping on orders over $150. Expedited shipping is $25.",
@@ -97,6 +100,67 @@ FALLBACK_COMPLEXITY_CLASSIFIER_PROMPT = (
     "simple, single-fact lookup a basic assistant could answer directly. "
     "Respond with exactly one word: COMPLEX or SIMPLE."
 )
+
+
+# ==========================================
+# SEMANTIC CACHE (Upstash Redis) - genuinely similarity-based, not exact-text.
+# Skipped entirely for image queries and anything that touches the cart, since a
+# replayed "added to cart" response without the tool actually firing would be a
+# real correctness bug, not just a stale answer.
+# ==========================================
+CACHE_PREFIX = "veloxa:cache:"
+CACHE_TTL_SECONDS = 3600
+CACHE_SIMILARITY_THRESHOLD = 0.93
+CACHE_MAX_SCAN = 30
+
+
+def cosine_similarity(a: list, b: list) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def check_semantic_cache(safe_text: str, trace: list) -> dict | None:
+    try:
+        query_emb = client.models.embed_content(model="gemini-embedding-001", contents=safe_text)
+        query_vector = query_emb.embeddings[0].values
+
+        keys = redis_client.keys(f"{CACHE_PREFIX}*")
+        best_score = 0.0
+        best_entry = None
+        for key in keys[:CACHE_MAX_SCAN]:
+            raw = redis_client.get(key)
+            if not raw:
+                continue
+            cached = json.loads(raw)
+            score = cosine_similarity(query_vector, cached["embedding"])
+            if score > best_score:
+                best_score = score
+                best_entry = cached["response"]
+
+        if best_entry and best_score >= CACHE_SIMILARITY_THRESHOLD:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Cache: HIT (similarity {best_score:.3f}) - skipping retrieval and generation.")
+            return best_entry
+
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Cache: MISS (best similarity {best_score:.3f}).")
+        return None
+    except Exception as e:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Cache: check failed ({type(e).__name__}) - proceeding without cache.")
+        return None
+
+
+def store_in_cache(safe_text: str, response: dict, trace: list):
+    try:
+        query_emb = client.models.embed_content(model="gemini-embedding-001", contents=safe_text)
+        query_vector = query_emb.embeddings[0].values
+        key = f"{CACHE_PREFIX}{uuid.uuid4()}"
+        redis_client.set(key, json.dumps({"embedding": query_vector, "response": response}), ex=CACHE_TTL_SECONDS)
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Cache: Stored response for future similar queries.")
+    except Exception as e:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Cache: store failed ({type(e).__name__}) - continuing without caching.")
 
 
 # ==========================================
@@ -497,7 +561,7 @@ def run_agent(
         if is_image_complex:
             reasons.append("image analysis")
         if is_competitive_match:
-            reasons.append(f"competitive match spread (gap {score_gap:.3f})")
+            reasons.append("competitive match spread")
         if is_reasoning_complex:
             reasons.append("genuine reasoning complexity")
         route_reason = " + ".join(reasons) if reasons else "Commodity, single clear match"
@@ -723,10 +787,28 @@ def chat(request: ChatRequest):
                 data=image_bytes, mime_type=request.image_mime_type or "image/jpeg"
             )
 
+        if not image_part:
+            cached = check_semantic_cache(safe_text, trace)
+            if cached:
+                get_client().flush()
+                return {
+                    "reply": cached.get("reply", ""),
+                    "recommendations": cached.get("recommendations", []),
+                    "trace_log": trace,
+                    "cart_actions": [],
+                    "cart_removals": [],
+                    "cart_cleared": False,
+                    "escalate": False,
+                }
+
         result = run_agent(
             safe_text, request.history, request.cart, trace,
             cart_actions, cart_removals, cart_cleared, image_part,
         )
+
+        if not image_part and not cart_actions and not cart_removals and not cart_cleared:
+            store_in_cache(safe_text, {"reply": result.get("reply"), "recommendations": result.get("recommendations", [])}, trace)
+
         get_client().flush()
 
         return {
