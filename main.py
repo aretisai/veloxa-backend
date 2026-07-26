@@ -543,13 +543,15 @@ def run_agent(
         )
 
         RELEVANCE_THRESHOLD = 0.4
+        PREMIUM_CONFIDENCE_THRESHOLD = 0.6
         COMPETITIVE_GAP_THRESHOLD = 0.05
+
+        top_score = relevance_scores[0] if relevance_scores else 0.0
 
         if directly_mentioned:
             routing_shoe = directly_mentioned
             has_confident_match = True
         else:
-            top_score = relevance_scores[0] if relevance_scores else 0.0
             has_confident_match = bool(relevant_shoes) and top_score >= RELEVANCE_THRESHOLD
             routing_shoe = relevant_shoes[0] if has_confident_match else None
 
@@ -558,16 +560,28 @@ def run_agent(
             has_confident_match and not directly_mentioned and score_gap < COMPETITIVE_GAP_THRESHOLD
         )
 
-        is_premium = has_confident_match and routing_shoe is not None and routing_shoe.get("financial_tier") == "Premium"
+        # Tier alone only earns Pro if the match is either a direct name mention
+        # (strongest possible signal) or genuinely high-confidence (>=0.6) - a
+        # merely on-topic match (>=0.4) can happen for broad browsing questions
+        # that don't reflect real interest in that specific, expensive item.
+        is_premium = (
+            routing_shoe is not None
+            and routing_shoe.get("financial_tier") == "Premium"
+            and (bool(directly_mentioned) or top_score >= PREMIUM_CONFIDENCE_THRESHOLD)
+        )
         is_image_complex = image_part is not None
 
-        # Only pay the extra latency of a dedicated check when nothing else has
-        # already earned Pro.
+        # The competitive-gap score can't distinguish "several strong contenders
+        # that genuinely need reasoning to choose between" from "several simple
+        # browsing results happen to be similarly relevant" - both look identical
+        # as a raw number. Rather than let the gap alone route to Pro, the
+        # properly-tuned Complexity Classifier is now the single, consistent judge
+        # whenever nothing stronger (premium tier, image) has already decided.
         is_reasoning_complex = False
-        if not is_premium and not is_image_complex and not is_competitive_match:
+        if not is_premium and not is_image_complex:
             is_reasoning_complex = check_reasoning_complexity(safe_text, trace)
 
-        is_complex = is_image_complex or is_competitive_match or is_reasoning_complex
+        is_complex = is_image_complex or is_reasoning_complex
         model_name = "gemini-3.1-pro-preview" if (is_premium or is_complex) else "gemini-2.5-flash"
 
         reasons = []
@@ -577,8 +591,6 @@ def run_agent(
             reasons.append("Premium tier")
         if is_image_complex:
             reasons.append("image analysis")
-        if is_competitive_match:
-            reasons.append("competitive match spread")
         if is_reasoning_complex:
             reasons.append("genuine reasoning complexity")
         route_reason = " + ".join(reasons) if reasons else "Commodity, single clear match"
@@ -592,7 +604,7 @@ def run_agent(
         })
         trace.append(
             f"[{time.strftime('%H:%M:%S')}] Model Router: {route_reason} "
-            f"(gap {score_gap:.3f}) - routing to {model_name}."
+            f"(top relevance {top_score:.3f}, gap {score_gap:.3f}) - routing to {model_name}."
         )
         compact_shoes = compact_for_prompt(relevant_shoes)
 
