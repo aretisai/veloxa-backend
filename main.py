@@ -104,7 +104,6 @@ FALLBACK_OUTPUT_VALIDATOR_PROMPT = (
     "sizing. The distinction is whether a specific, unlisted product name is "
     "being fabricated as real, not whether any attribute is mentioned at all."
 )
-)
 
 FALLBACK_COMPLEXITY_CLASSIFIER_PROMPT = """You are a query complexity classifier for a retail footwear assistant. Your default answer is SIMPLE. Only answer COMPLEX when the question genuinely cannot be answered well without multi-step reasoning or domain expertise.
 
