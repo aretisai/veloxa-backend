@@ -94,19 +94,32 @@ FALLBACK_VISION_AGENT_PROMPT = (
 
 FALLBACK_OUTPUT_VALIDATOR_PROMPT = (
     "You are a strict output validator for a retail assistant. You will be given "
-    "a draft reply and a list of the ONLY valid product names it's allowed to mention. "
-    "Respond with exactly one word: PASS if the reply only references those products "
-    "(or mentions none by name), or FAIL if it names any product not in that list."
+    "a draft reply and a list of the ONLY valid product names the assistant may "
+    "present as available. Respond with exactly one word: PASS if the reply "
+    "presents only listed products as available, mentions no specific product by "
+    "name, names an unlisted product solely to say it isn't carried, or makes a "
+    "general statement about the catalog as a whole without inventing a specific "
+    "named product. FAIL only if the reply presents a specific unlisted product "
+    "name as though it is real, available, or has its own price, colours, or "
+    "sizing. The distinction is whether a specific, unlisted product name is "
+    "being fabricated as real, not whether any attribute is mentioned at all."
+)
 )
 
-FALLBACK_COMPLEXITY_CLASSIFIER_PROMPT = (
-    "You are a query complexity classifier for a retail shopping assistant. "
-    "Decide whether this question requires genuine multi-step reasoning, technical "
-    "or domain expertise (e.g. biomechanics, injury considerations, technical "
-    "tradeoffs), or synthesizing multiple competing constraints - as opposed to a "
-    "simple, single-fact lookup a basic assistant could answer directly. "
-    "Respond with exactly one word: COMPLEX or SIMPLE."
-)
+FALLBACK_COMPLEXITY_CLASSIFIER_PROMPT = """You are a query complexity classifier for a retail footwear assistant. Your default answer is SIMPLE. Only answer COMPLEX when the question genuinely cannot be answered well without multi-step reasoning or domain expertise.
+
+COMPLEX means: biomechanics, injury or medical context, technical tradeoffs between product characteristics, or a genuine comparison requiring the assistant to weigh competing factors against each other.
+
+SIMPLE means: anything answerable from product data alone - availability, price, colours, sizing, stock, store policy, or filtering by criteria such as category, budget or colour. Multiple filters in one question is still SIMPLE.
+
+Examples:
+"What colours does the Apex Runner come in?" -> SIMPLE
+"Show me black trail shoes under $150" -> SIMPLE
+"What is your return policy?" -> SIMPLE
+"Which is better for flat feet, minimal or maximal cushioning?" -> COMPLEX
+"I overpronate and run 40 miles a week - what should I consider?" -> COMPLEX
+
+Respond with exactly one word: COMPLEX or SIMPLE."""
 
 
 # ==========================================
