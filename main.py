@@ -673,6 +673,10 @@ def run_agent(
         trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
         response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
 
+        if not response.function_calls and not response.text:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Empty response, no tool call - retrying once...")
+            response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
+
         if response.function_calls:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Agent: Tool execution requested.")
             contents.append(response.candidates[0].content)
@@ -695,6 +699,10 @@ def run_agent(
 
             trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Returning tool output for final synthesis...")
             response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
+
+            if not response.text:
+                trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Empty synthesis response - retrying once...")
+                response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
 
         if not response.text:
             trace.append(f"[{time.strftime('%H:%M:%S')}] Error: Model returned no text content on synthesis (known edge case with thinking-enabled models after a tool call).")
@@ -747,8 +755,13 @@ def run_agent(
                 "cacheable": False,
             }
 
+        # If retrieval had already succeeded before this failure, keep the shoe's
+        # name in the fallback - a generic message here would otherwise erase it
+        # from the short history window the next turn's search depends on.
+        fallback_shoes = locals().get("relevant_shoes")
+        context_note = f" I believe we were just discussing the {fallback_shoes[0]['model']}." if fallback_shoes else ""
         return {
-            "reply": "I'm experiencing high demand right now and couldn't process that. Please try again in a moment.",
+            "reply": f"I'm experiencing high demand right now and couldn't process that.{context_note} Please try again in a moment.",
             "recommendations": [],
             "cacheable": False,
         }
