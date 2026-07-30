@@ -873,7 +873,7 @@ def chat(request: ChatRequest):
             get_client().update_current_span(metadata={"escalated": "true"})
             get_client().flush()
             return {
-                "reply": "I am escalating your request to a specialized human agent.",
+                "reply": "This isn't something I can resolve, and I don't want to give you a runaround - I'm flagging it directly to a member of our team as a priority case, separate from general support.",
                 "recommendations": [],
                 "trace_log": trace,
                 "cart_actions": cart_actions,
