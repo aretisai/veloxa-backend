@@ -194,7 +194,7 @@ def store_in_cache(safe_text: str, response: dict, trace: list):
 # ==========================================
 # RESILIENCE: shared retry wrapper for every direct Gemini call
 # ==========================================
-def generate_with_retry(model: str, contents: list, config, trace: list, max_retries: int = 1):
+def generate_with_retry(model: str, contents: list, config, trace: list, max_retries: int = 2):
     last_error = None
     for attempt in range(max_retries + 1):
         try:
@@ -217,8 +217,9 @@ def generate_with_retry(model: str, contents: list, config, trace: list, max_ret
             last_error = e
             is_transient = "503" in str(e) or "UNAVAILABLE" in str(e)
             if is_transient and attempt < max_retries:
-                trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: {model} temporarily overloaded, retrying...")
-                time.sleep(2)
+                wait = 2 * (attempt + 1)
+                trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: {model} temporarily overloaded, retrying in {wait}s...")
+                time.sleep(wait)
                 continue
             raise last_error
     raise last_error
@@ -462,14 +463,73 @@ def call_concierge_model(model_name: str, contents: list, config, trace: list, p
     return generate_with_retry(model_name, contents, config, trace)
 
 
-def compact_for_prompt(shoes: list) -> list:
-    """Same stock/price fidelity, without repeating the image path once per size row."""
+def build_agent_config(model_name: str, system_instruction: str, tools: list):
+    if model_name == "gemini-3.1-pro-preview":
+        return types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            tools=tools,
+            thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
+        )
+    return types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=0.3,
+        tools=tools,
+    )
+
+
+def attempt_concierge_response(model_name, contents, system_instruction, tools, tool_map, trace, prompt):
+    """One full attempt at getting a valid reply from a specific model - including
+    tool execution and the existing empty-response retries. Raises if no usable
+    text is ever produced, so the caller can decide whether a same-model retry
+    already happened (nothing more to do) or a different model should be tried."""
+    agent_config = build_agent_config(model_name, system_instruction, tools)
+
+    trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
+    response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
+    call_tokens = getattr(response, "usage_metadata", None)
+    if call_tokens:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Token Audit: input={call_tokens.prompt_token_count}, output={call_tokens.candidates_token_count}.")
+
+    if not response.function_calls and not response.text:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Empty response, no tool call - retrying once...")
+        response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
+
+    if response.function_calls:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Agent: Tool execution requested.")
+        contents.append(response.candidates[0].content)
+
+        tool_responses = []
+        for call in response.function_calls:
+            fn = tool_map.get(call.name)
+            if fn:
+                result = fn(**call.args)
+                tool_responses.append(
+                    types.Part.from_function_response(name=call.name, response={"result": result})
+                )
+        contents.append(types.Content(role="user", parts=tool_responses))
+
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Returning tool output for final synthesis...")
+        response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
+
+        if not response.text:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Empty synthesis response - retrying once...")
+            response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
+
+    if not response.text:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Error: {model_name} returned no usable text content.")
+        raise ValueError(f"Empty response text from {model_name}")
+
+    return response
+
+
+def compact_for_prompt(shoes: list, full_detail_ids: set) -> list:
+    """Full per-size stock detail only for shoes actually under discussion - a broad
+    browsing query has no use for exhaustive stock on 4 products nobody's decided on
+    yet, and even a named-product question only needs that level of detail for the
+    one shoe actually being asked about."""
     compact = []
     for shoe in shoes:
-        stock: dict = {}
-        for item in shoe["inventory"]:
-            stock.setdefault(item["color"], {})[item["size"]] = item["stock"]
-        compact.append({
+        entry = {
             "id": shoe["id"],
             "model": shoe["model"],
             "category": shoe["category"],
@@ -478,9 +538,17 @@ def compact_for_prompt(shoes: list) -> list:
             "on_sale": shoe["price"] != shoe["finalPrice"],
             "financial_tier": shoe.get("financial_tier"),
             "colors": shoe["colors_available"],
-            "stock_by_color_and_size": stock,
             "specs": shoe.get("performance_specs", {}),
-        })
+        }
+        if shoe["id"] in full_detail_ids:
+            stock: dict = {}
+            for item in shoe["inventory"]:
+                stock.setdefault(item["color"], {})[item["size"]] = item["stock"]
+            entry["stock_by_color_and_size"] = stock
+            entry["detailed_stock_available"] = True
+        else:
+            entry["detailed_stock_available"] = False
+        compact.append(entry)
     return compact
 
 
@@ -607,14 +675,33 @@ def run_agent(
             has_confident_match and not directly_mentioned and score_gap < COMPETITIVE_GAP_THRESHOLD
         )
 
+        # Any retrieved shoe named in this message OR recent history gets full stock
+        # detail; everything else (including all 4 on a broad browsing query) gets
+        # the lighter summary - this is the actual fix for the token-waste finding.
+        recent_history_text = " ".join(msg["text"] for msg in history[-3:])
+        mention_context = (safe_text + " " + recent_history_text).lower()
+        full_detail_ids = {s["id"] for s in relevant_shoes if s["model"].lower() in mention_context}
+
         # Tier alone only earns Pro if the match is either a direct name mention
         # (strongest possible signal) or genuinely high-confidence (>=0.6) - a
         # merely on-topic match (>=0.4) can happen for broad browsing questions
         # that don't reflect real interest in that specific, expensive item.
+        # A cart-action message ("add it", "remove the black one") doesn't need
+        # premium reasoning even when it names a premium product - confirming a
+        # mutation is equally simple regardless of price. Only downgrade when the
+        # message looks like a pure action, not also a genuine question - a
+        # mixed "does this suit me, and if so add it" message should keep its
+        # premium reasoning for the part that actually needs it.
+        CART_ACTION_WORDS = ["add", "buy", "purchase", "remove", "delete", "clear", "checkout"]
+        looks_like_pure_cart_action = (
+            any(w in safe_text.lower() for w in CART_ACTION_WORDS) and "?" not in safe_text
+        )
+
         is_premium = (
             routing_shoe is not None
             and routing_shoe.get("financial_tier") == "Premium"
             and (bool(directly_mentioned) or top_score >= PREMIUM_CONFIDENCE_THRESHOLD)
+            and not looks_like_pure_cart_action
         )
         is_image_complex = image_part is not None
 
@@ -636,6 +723,8 @@ def run_agent(
             reasons.append(f"'{directly_mentioned['model']}' directly named")
         if is_premium:
             reasons.append("Premium tier")
+        elif looks_like_pure_cart_action and routing_shoe is not None and routing_shoe.get("financial_tier") == "Premium":
+            reasons.append("cart action on Premium product - reasoning not required, routed Commodity")
         if is_image_complex:
             reasons.append("image analysis")
         if is_reasoning_complex:
@@ -653,7 +742,7 @@ def run_agent(
             f"[{time.strftime('%H:%M:%S')}] Model Router: {route_reason} "
             f"(top relevance {top_score:.3f}, gap {score_gap:.3f}) - routing to {model_name}."
         )
-        compact_shoes = compact_for_prompt(relevant_shoes)
+        compact_shoes = compact_for_prompt(relevant_shoes, full_detail_ids)
 
         history_str = "\n".join([f"{msg['role'].upper()}: {msg['text']}" for msg in history[-3:]])
         image_context = f"IMAGE ANALYSIS FROM VISION AGENT: {vision_description}" if vision_description else ""
@@ -669,64 +758,42 @@ def run_agent(
         add_to_cart_tool, remove_from_cart_tool, clear_cart_tool = make_cart_tools(
             trace, cart_actions, cart_removals, cart_cleared
         )
+        tools = [add_to_cart_tool, remove_from_cart_tool, clear_cart_tool]
+        tool_map = {
+            "add_to_cart": add_to_cart_tool,
+            "remove_from_cart": remove_from_cart_tool,
+            "clear_cart": clear_cart_tool,
+        }
 
-        if model_name == "gemini-3.1-pro-preview":
-            agent_config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
-                thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
+        def fresh_contents():
+            return [
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=f"HISTORY:\n{history_str}\nUSER: {safe_text}")],
+                )
+            ]
+
+        try:
+            response = attempt_concierge_response(
+                model_name, fresh_contents(), system_instruction, tools, tool_map, trace, prompt
             )
-        else:
-            agent_config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.3,
-                tools=[add_to_cart_tool, remove_from_cart_tool, clear_cart_tool],
-            )
-
-        contents = [
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=f"HISTORY:\n{history_str}\nUSER: {safe_text}")],
-            )
-        ]
-
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Calling {model_name}...")
-        response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
-
-        if not response.function_calls and not response.text:
-            trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Empty response, no tool call - retrying once...")
-            response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
-
-        if response.function_calls:
-            trace.append(f"[{time.strftime('%H:%M:%S')}] Agent: Tool execution requested.")
-            contents.append(response.candidates[0].content)
-
-            tool_map = {
-                "add_to_cart": add_to_cart_tool,
-                "remove_from_cart": remove_from_cart_tool,
-                "clear_cart": clear_cart_tool,
-            }
-
-            tool_responses = []
-            for call in response.function_calls:
-                fn = tool_map.get(call.name)
-                if fn:
-                    result = fn(**call.args)
-                    tool_responses.append(
-                        types.Part.from_function_response(name=call.name, response={"result": result})
-                    )
-            contents.append(types.Content(role="user", parts=tool_responses))
-
-            trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Returning tool output for final synthesis...")
-            response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
-
-            if not response.text:
-                trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Empty synthesis response - retrying once...")
-                response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
-
-        if not response.text:
-            trace.append(f"[{time.strftime('%H:%M:%S')}] Error: Model returned no text content on synthesis (known edge case with thinking-enabled models after a tool call).")
-            raise ValueError("Empty response text")
+        except Exception as e:
+            # Only safe to retry on a different model if nothing has actually
+            # happened yet - if a tool already executed before this failure,
+            # retrying fresh risks calling it a second time for one request.
+            already_acted = bool(cart_actions or cart_removals or cart_cleared)
+            if model_name == "gemini-3.1-pro-preview" and not already_acted:
+                trace.append(
+                    f"[{time.strftime('%H:%M:%S')}] Orchestrator: {model_name} failed "
+                    f"({type(e).__name__}) before any cart action - falling back to gemini-2.5-flash for a working reply."
+                )
+                get_client().update_current_span(metadata={"premium_fallback": "true"})
+                model_name = "gemini-2.5-flash"
+                response = attempt_concierge_response(
+                    model_name, fresh_contents(), system_instruction, tools, tool_map, trace, prompt
+                )
+            else:
+                raise
 
         raw_text = response.text.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw_text)
