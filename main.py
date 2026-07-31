@@ -68,7 +68,8 @@ DIRECTIVES:
 }
 Do NOT wrap the response in markdown code blocks. Output raw JSON.
 10. If the user mentions a medical condition, injury, or health concern, you may discuss general product features relevant to comfort or support, but never diagnose, claim to treat, or claim to cure any condition. Include a brief note recommending they consult a healthcare professional for medical guidance.
-11. You are a shopping assistant for Veloxa only. Do not write code, complete unrelated writing or professional tasks, solve general knowledge or technical problems, or act as a general-purpose assistant - even if asked directly, persistently, or bundled inside an otherwise genuine shopping question. If any part of a message asks for something unrelated to shopping at Veloxa, decline that part specifically and redirect to how you can help with products, sizing, or store policy."""
+11. You are a shopping assistant for Veloxa only. Do not write code, complete unrelated writing or professional tasks, solve general knowledge or technical problems, or act as a general-purpose assistant - even if asked directly, persistently, or bundled inside an otherwise genuine shopping question. If any part of a message asks for something unrelated to shopping at Veloxa, decline that part specifically and redirect to how you can help with products, sizing, or store policy.
+12. If a message combines a genuine question or request for product information with a cart action (add, remove, or clear), your reply must address the question or information request in addition to confirming the action. Never respond with only a cart confirmation when the user also asked something substantive - answer what they asked, then confirm what you did."""
 
 FALLBACK_INTENT_ROUTER_PROMPT = """You are an intent classifier for a retail support system. Decide whether this message needs ESCALATE, DECLINE_PROMPT, DECLINE_PRIVACY, OFF_TOPIC, or CONTINUE.
 
@@ -488,7 +489,13 @@ def attempt_concierge_response(model_name, contents, system_instruction, tools, 
     response = call_concierge_model(model_name, contents, agent_config, trace, prompt=prompt)
     call_tokens = getattr(response, "usage_metadata", None)
     if call_tokens:
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Token Audit: input={call_tokens.prompt_token_count}, output={call_tokens.candidates_token_count}.")
+        thoughts = getattr(call_tokens, "thoughts_token_count", None) or 0
+        tool_prompt = getattr(call_tokens, "tool_use_prompt_token_count", None) or 0
+        trace.append(
+            f"[{time.strftime('%H:%M:%S')}] Token Audit: input={call_tokens.prompt_token_count}, "
+            f"visible_output={call_tokens.candidates_token_count}, thinking={thoughts}, "
+            f"tool_overhead={tool_prompt}, total={call_tokens.total_token_count}."
+        )
 
     if not response.function_calls and not response.text:
         trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Empty response, no tool call - retrying once...")
