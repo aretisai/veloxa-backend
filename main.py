@@ -5,6 +5,7 @@ import re
 import uuid
 import base64
 import math
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -199,7 +200,13 @@ def generate_with_retry(model: str, contents: list, config, trace: list, max_ret
     last_error = None
     for attempt in range(max_retries + 1):
         try:
-            response = client.models.generate_content(model=model, contents=contents, config=config)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(client.models.generate_content, model=model, contents=contents, config=config)
+                try:
+                    response = future.result(timeout=45)
+                except concurrent.futures.TimeoutError:
+                    trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: {model} exceeded 30s - treating as failed rather than waiting further.")
+                    raise TimeoutError(f"{model} exceeded 30s timeout")
             usage = getattr(response, "usage_metadata", None)
             if usage:
                 try:
