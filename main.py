@@ -205,8 +205,8 @@ def generate_with_retry(model: str, contents: list, config, trace: list, max_ret
                 try:
                     response = future.result(timeout=45)
                 except concurrent.futures.TimeoutError:
-                    trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: {model} exceeded 30s - treating as failed rather than waiting further.")
-                    raise TimeoutError(f"{model} exceeded 30s timeout")
+                    trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: {model} exceeded 45s - treating as failed rather than waiting further.")
+                    raise TimeoutError(f"{model} exceeded 45s timeout")
             usage = getattr(response, "usage_metadata", None)
             if usage:
                 try:
