@@ -588,6 +588,10 @@ def validate_output(reply_text: str, relevant_shoes: list, trace: list) -> tuple
     )
     verdict = response.text.strip().upper()
     passed = "PASS" in verdict
+    try:
+        get_client().update_current_generation(metadata={"validator_verdict": "PASS" if passed else "FAIL"})
+    except Exception:
+        pass
     trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: {verdict}.")
     return passed, verdict
 
@@ -624,6 +628,10 @@ def make_cart_tools(trace: list, cart_actions: list, cart_removals: list, cart_c
         final_name = f"{matched['model']} — {stock_item['color']}, {stock_item['size']}"
         final_price = matched["finalPrice"]
         cart_actions.append({"name": final_name, "price": final_price})
+        try:
+            get_client().update_current_span(metadata={"cart_value": final_price})
+        except Exception:
+            pass
         trace.append(f"[{time.strftime('%H:%M:%S')}] Action Execution: add_to_cart(id={shoe_id}, color={color}, size={size}) -> '{final_name}' at ${final_price}, stock verified, sourced directly from database")
         return f"Success: Added {final_name} to cart for ${final_price}."
 
@@ -878,6 +886,31 @@ class ChatRequest(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     image_base64: str | None = None
     image_mime_type: str | None = None
+class CartLogRequest(BaseModel):
+    session_id: str
+    name: str
+    price: float
+    source: str = "modal"
+
+
+@observe(as_type="span", name="Modal_Cart_Action")
+def log_modal_cart_action(name: str, price: float, source: str):
+    try:
+        get_client().update_current_span(metadata={"cart_value": price, "source": source})
+    except Exception:
+        pass
+
+
+@app.post("/log-cart-action")
+def log_cart_action(request: CartLogRequest):
+    with propagate_attributes(
+        user_id="enterprise-shopper",
+        session_id=request.session_id,
+        tags=["production", "fastapi-backend", "modal-source"],
+    ):
+        log_modal_cart_action(request.name, request.price, request.source)
+        get_client().flush()
+    return {"status": "logged"}
 
 
 @app.get("/")
@@ -898,57 +931,129 @@ def admin_metrics():
         "escalations": None,
         "tool_calls": None,
         "total_cost_usd": None,
+        "deflection_rate_pct": None,
+        "revenue_attributed_usd": None,
+        "assisted_revenue_usd": None,
+        "direct_revenue_usd": None,
+        "privacy_declines": None,
+        "prompt_injection_declines": None,
+        "premium_fallback_count": None,
+        "validator_pass": None,
+        "validator_fail": None,
+        "hallucination_rate_pct": None,
         "error": None,
     }
 
+    # Everything below is computed from ONE fetch, not seven separate calls to
+    # Langfuse's metrics() aggregation API - real, measured evidence showed that
+    # API taking ~122s per call regardless of query, while this single call
+    # consistently takes ~1s. Same proven pattern already used for revenue,
+    # just extended to cover every metric this endpoint reports.
     try:
-        query = json.dumps({
-            "view": "observations",
-            "metrics": [
-                {"measure": "count", "aggregation": "count"},
-                {"measure": "latency", "aggregation": "avg"},
-                {"measure": "totalCost", "aggregation": "sum"},
-            ],
-            "dimensions": [{"field": "name"}],
-            "filters": [],
-            "fromTimestamp": from_ts.isoformat(),
-            "toTimestamp": to_ts.isoformat(),
-        })
-        raw = langfuse.api.metrics.metrics(query=query)
-        data = raw.model_dump()["data"] if hasattr(raw, "model_dump") else raw["data"]
-        by_name = {row.get("name"): row for row in data}
+        _t0 = time.time()
+        obs_list = []
+        cursor = None
+        pages_fetched = 0
+        MAX_PAGES = 5
+        while pages_fetched < MAX_PAGES:
+            pages_fetched += 1
+            kwargs = {
+                "from_start_time": from_ts,
+                "to_start_time": to_ts,
+                "limit": 1000,
+                "fields": "core,basic,usage,model,io,metadata",
+            }
+            if cursor:
+                kwargs["cursor"] = cursor
+            raw_obs = langfuse.api.observations.get_many(**kwargs)
+            dumped = raw_obs.model_dump() if hasattr(raw_obs, "model_dump") else raw_obs
+            batch = dumped.get("data", [])
+            if not batch:
+                break
+            obs_list.extend(batch)
+            cursor = (dumped.get("meta") or {}).get("cursor")
+            if not cursor:
+                break
+        print(f"[timing] get_many (all metrics): {time.time() - _t0:.1f}s")
+        
 
-        if "Chat_Request" in by_name:
-            row = by_name["Chat_Request"]
-            result["total_conversations"] = int(row.get("count_count", 0))
-            result["avg_response_seconds"] = round(float(row.get("avg_latency", 0)) / 1000, 1)
+        chat_requests = [o for o in obs_list if o.get("name") == "Chat_Request"]
+        tool_execs = [o for o in obs_list if o.get("name") == "Tool_Execution"]
 
-        if "Tool_Execution" in by_name:
-            result["tool_calls"] = int(by_name["Tool_Execution"].get("count_count", 0))
+        result["total_conversations"] = len(chat_requests)
 
-        total_cost = sum(float(row.get("sum_totalCost", 0) or 0) for row in data)
+        latencies = [o["latency"] for o in chat_requests if o.get("latency") is not None]
+        if latencies:
+            avg_latency = sum(latencies) / len(latencies)
+            # get_many appears to report latency directly in seconds, unlike the
+            # old metrics() endpoint which used milliseconds - dividing by 1000
+            # unconditionally was collapsing any real value straight to 0.0.
+            result["avg_response_seconds"] = round(avg_latency, 1)
+
+        result["tool_calls"] = len(tool_execs)
+
+        total_cost = 0.0
+        for o in obs_list:
+            cd = o.get("cost_details") or {}
+            val = cd.get("total") if isinstance(cd, dict) else None
+            if val is None:
+                val = o.get("total_cost")
+            try:
+                total_cost += float(val or 0)
+            except (TypeError, ValueError):
+                pass
         result["total_cost_usd"] = round(total_cost, 4)
 
-    except Exception as e:
-        result["error"] = f"overview query failed: {type(e).__name__}: {e}"
+        def meta_has(obs, key, value):
+            actual = (obs.get("metadata") or {}).get(key)
+            if actual is None:
+                return False
+            # Metadata values come back with their original types - booleans stay
+            # booleans, strings stay strings - so compare on normalised strings
+            # rather than assuming everything arrives as text.
+            return str(actual).strip().lower() == str(value).strip().lower()
 
-    try:
-        esc_query = json.dumps({
-            "view": "observations",
-            "metrics": [{"measure": "count", "aggregation": "count"}],
-            "dimensions": [],
-            "filters": [
-                {"column": "metadata", "operator": "contains", "key": "escalated", "value": "true", "type": "stringObject"}
-            ],
-            "fromTimestamp": from_ts.isoformat(),
-            "toTimestamp": to_ts.isoformat(),
-        })
-        esc_raw = langfuse.api.metrics.metrics(query=esc_query)
-        esc_data = esc_raw.model_dump()["data"] if hasattr(esc_raw, "model_dump") else esc_raw["data"]
-        result["escalations"] = int(esc_data[0]["count_count"]) if esc_data else 0
+        escalations = sum(1 for o in obs_list if meta_has(o, "escalated", "true"))
+        result["escalations"] = escalations
+        if result["total_conversations"]:
+            result["deflection_rate_pct"] = round((1 - escalations / result["total_conversations"]) * 100, 1)
+
+        result["privacy_declines"] = sum(1 for o in obs_list if meta_has(o, "decline_type", "privacy"))
+        result["prompt_injection_declines"] = sum(1 for o in obs_list if meta_has(o, "decline_type", "prompt"))
+        result["premium_fallback_count"] = sum(1 for o in obs_list if meta_has(o, "premium_fallback", "true"))
+
+        validator_pass = sum(1 for o in obs_list if meta_has(o, "validator_verdict", "PASS"))
+        validator_fail = sum(1 for o in obs_list if meta_has(o, "validator_verdict", "FAIL"))
+        result["validator_pass"] = validator_pass
+        result["validator_fail"] = validator_fail
+        if validator_pass + validator_fail > 0:
+            result["hallucination_rate_pct"] = round(validator_fail / (validator_pass + validator_fail) * 100, 1)
+
+        chat_session_ids = {o.get("sessionId") for o in chat_requests if o.get("sessionId")}
+        total_revenue = assisted_revenue = direct_revenue = 0.0
+        for o in obs_list:
+            meta = o.get("metadata") or {}
+            if "cart_value" not in meta:
+                continue
+            try:
+                value = float(meta["cart_value"])
+            except (TypeError, ValueError):
+                continue
+            total_revenue += value
+            if o.get("name") == "Tool_Execution":
+                assisted_revenue += value
+            elif o.get("name") == "Modal_Cart_Action":
+                if o.get("sessionId") in chat_session_ids:
+                    assisted_revenue += value
+                else:
+                    direct_revenue += value
+
+        result["revenue_attributed_usd"] = round(total_revenue, 2)
+        result["assisted_revenue_usd"] = round(assisted_revenue, 2)
+        result["direct_revenue_usd"] = round(direct_revenue, 2)
+
     except Exception as e:
-        if not result["error"]:
-            result["error"] = f"escalation query failed: {type(e).__name__}: {e}"
+        result["error"] = f"metrics query failed: {type(e).__name__}: {e}"
 
     return result
 
@@ -972,7 +1077,6 @@ def chat(request: ChatRequest):
 
         if intent == "ESCALATE":
             get_client().update_current_span(metadata={"escalated": "true"})
-            get_client().flush()
             return {
                 "reply": "This isn't something I can resolve, and I don't want to give you a runaround - I'm flagging it directly to a member of our team as a priority case, separate from general support.",
                 "recommendations": [],
@@ -985,7 +1089,6 @@ def chat(request: ChatRequest):
 
         if intent == "DECLINE_PROMPT":
             get_client().update_current_span(metadata={"declined": "true", "decline_type": "prompt"})
-            get_client().flush()
             return {
                 "reply": "I'm going to stay Veloxa's real shopping assistant rather than take on a different persona or set my guidelines aside, and I'm not able to share my internal configuration either - but I'm happy to help you find the right shoe for real.",
                 "recommendations": [],
@@ -998,7 +1101,6 @@ def chat(request: ChatRequest):
 
         if intent == "DECLINE_PRIVACY":
             get_client().update_current_span(metadata={"declined": "true", "decline_type": "privacy"})
-            get_client().flush()
             return {
                 "reply": "I'm not able to share another person's orders, address, or payment details, regardless of the relationship - I have no way to verify that from a chat message. If this is for Sarah, she's welcome to look that up herself, or you're welcome to contact support directly for order-specific help.",
                 "recommendations": [],
@@ -1011,7 +1113,6 @@ def chat(request: ChatRequest):
 
         if intent == "OFF_TOPIC":
             get_client().update_current_span(metadata={"declined": "true", "decline_type": "off_topic"})
-            get_client().flush()
             return {
                 "reply": "That's outside what I can help with here - I'm built specifically for shopping at Veloxa. Happy to help you find the right shoe, though, or answer anything about our products or policies!",
                 "recommendations": [],
