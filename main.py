@@ -595,6 +595,66 @@ def validate_output(reply_text: str, relevant_shoes: list, trace: list) -> tuple
     trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: {verdict}.")
     return passed, verdict
 
+# Deterministic grounding check - no LLM involved. Compares concrete claims in
+# the reply against the catalog data actually passed to the model. Flags and
+# logs rather than blocking: a heuristic false positive should never break an
+# otherwise good reply.
+KNOWN_COLOURS = {
+    "black", "blue", "brown", "green", "grey", "gray", "orange", "pink",
+    "red", "white", "yellow", "purple", "teal", "navy", "beige", "silver", "gold",
+}
+
+
+def check_citation_accuracy(reply_text: str, relevant_shoes: list, current_cart: list, trace: list) -> dict:
+    price_issues = []
+    colour_issues = []
+
+    valid_prices = set()
+    for s in relevant_shoes:
+        valid_prices.add(int(s["price"]))
+        valid_prices.add(int(s["finalPrice"]))
+    valid_prices.update({150, 25})
+    if current_cart:
+        valid_prices.add(sum(int(i.get("price", 0)) for i in current_cart))
+        for i in current_cart:
+            valid_prices.add(int(i.get("price", 0)))
+
+    for match in re.findall(r"\$(\d+(?:\.\d{1,2})?)", reply_text):
+        value = int(float(match))
+        if value not in valid_prices:
+            price_issues.append(f"${value}")
+
+    valid_colours = {c.lower() for s in relevant_shoes for c in s["colors_available"]}
+    if "grey" in valid_colours:
+        valid_colours.add("gray")
+    if "gray" in valid_colours:
+        valid_colours.add("grey")
+    lowered = reply_text.lower()
+    for colour in KNOWN_COLOURS:
+        if re.search(rf"\b{colour}\b", lowered) and colour not in valid_colours:
+            colour_issues.append(colour)
+
+    price_ok = not price_issues
+    colour_ok = not colour_issues
+
+    if not price_ok:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Citation Check: unverified price(s) in reply: {', '.join(price_issues)}")
+    if not colour_ok:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Citation Check: colour(s) not on any retrieved product: {', '.join(colour_issues)}")
+    if price_ok and colour_ok:
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Citation Check: all prices and colours verified against catalog.")
+
+    try:
+        get_client().update_current_span(metadata={
+            "citation_price_ok": price_ok,
+            "citation_colour_ok": colour_ok,
+        })
+    except Exception:
+        pass
+
+    return {"price_ok": price_ok, "colour_ok": colour_ok}
+
+
 
 # ==========================================
 # TOOL CALLING (scoped per-request, not global)
@@ -832,6 +892,11 @@ def run_agent(
             trace.append(f"[{time.strftime('%H:%M:%S')}] Output Validator: check failed ({type(e).__name__}) - showing reply unvalidated.")
             data["cacheable"] = False
 
+        try:
+            check_citation_accuracy(data.get("reply", ""), relevant_shoes, current_cart, trace)
+        except Exception as e:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Citation Check: failed ({type(e).__name__}) - skipped.")
+
         return data
 
     except json.JSONDecodeError:
@@ -941,6 +1006,10 @@ def admin_metrics():
         "validator_pass": None,
         "validator_fail": None,
         "hallucination_rate_pct": None,
+        "citation_checked": None,
+        "price_accuracy_pct": None,
+        "colour_flag_count": None,
+        "intent_distribution": None,
         "error": None,
     }
 
@@ -1028,6 +1097,17 @@ def admin_metrics():
         result["validator_fail"] = validator_fail
         if validator_pass + validator_fail > 0:
             result["hallucination_rate_pct"] = round(validator_fail / (validator_pass + validator_fail) * 100, 1)
+            citation_checked = sum(1 for o in obs_list if (o.get("metadata") or {}).get("citation_price_ok") is not None)
+        price_issues = sum(1 for o in obs_list if meta_has(o, "citation_price_ok", "false"))
+        colour_issues = sum(1 for o in obs_list if meta_has(o, "citation_colour_ok", "false"))
+        result["citation_checked"] = citation_checked
+        result["price_accuracy_pct"] = round((1 - price_issues / citation_checked) * 100, 1) if citation_checked else None
+        result["colour_flag_count"] = colour_issues
+
+        result["intent_distribution"] = {
+            k: sum(1 for o in obs_list if meta_has(o, "intent_classification", k))
+            for k in ["CONTINUE", "ESCALATE", "DECLINE_PROMPT", "DECLINE_PRIVACY", "OFF_TOPIC"]
+        }
 
         chat_session_ids = {o.get("sessionId") for o in chat_requests if o.get("sessionId")}
         total_revenue = assisted_revenue = direct_revenue = 0.0
@@ -1074,6 +1154,10 @@ def chat(request: ChatRequest):
         safe_text = scrub_pii(request.message, trace)
 
         intent = check_hitl_escalation(safe_text, trace)
+        try:
+            get_client().update_current_span(metadata={"intent_classification": intent})
+        except Exception:
+            pass
 
         if intent == "ESCALATE":
             get_client().update_current_span(metadata={"escalated": "true"})
