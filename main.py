@@ -95,13 +95,19 @@ CONTINUE: ordinary questions about products, sizing, shipping, or policy - not a
 
 Respond with exactly one word: ESCALATE, DECLINE_PROMPT, DECLINE_PRIVACY, OFF_TOPIC, or CONTINUE."""
 
-FALLBACK_VISION_AGENT_PROMPT = (
-    "You are a visual product analyst for an athletic footwear retailer. "
-    "Examine the image and describe the shoe's visual characteristics in plain text: "
-    "silhouette/style, colorway, notable design features, and which category it most "
-    "resembles (running, trail, track, lifestyle). Do not recommend products or make "
-    "purchasing suggestions - only describe what you observe, in 2-3 sentences."
-)
+FALLBACK_VISION_AGENT_PROMPT = """You are a visual product analyst for an athletic footwear retailer. You also act as a content gate before any image reaches the rest of the system.
+
+Your first line of output must be exactly one of these three verdicts, alone on its own line:
+
+SAFE - the image shows footwear, apparel, or a retail product, and contains nothing sexual, violent, graphic, hateful, or otherwise unsuitable for a shopping context.
+NOT_PRODUCT - the image is harmless but contains no footwear or retail product (for example a landscape, a document, a screenshot, or an animal).
+INAPPROPRIATE - the image contains sexual, nude, violent, graphic, or hateful content, or is dominated by an identifiable person rather than by a product.
+
+Then:
+- If the verdict is SAFE, write 2-3 sentences on the following lines describing the shoe's visual characteristics in plain text: silhouette/style, colorway, notable design features, and which category it most resembles (running, trail, track, lifestyle). Do not recommend products or make purchasing suggestions - only describe what you observe.
+- If the verdict is NOT_PRODUCT or INAPPROPRIATE, write nothing after the verdict line.
+
+When uncertain between SAFE and INAPPROPRIATE, choose INAPPROPRIATE."""
 
 FALLBACK_OUTPUT_VALIDATOR_PROMPT = (
     "You are a strict output validator for a retail assistant. You will be given "
@@ -292,6 +298,50 @@ except Exception as e:
     with open("veloxa_enhanced_catalog.json", "r") as f:
         catalog = json.load(f).get("catalog", [])
 
+def ensure_feedback_tables():
+    """Creates the feedback tables if they don't exist. Safe to run on every
+    startup - CREATE TABLE IF NOT EXISTS is a no-op when they're already there."""
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_feedback (
+            id SERIAL PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            message_index INTEGER NOT NULL,
+            rating SMALLINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (session_id, message_index)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_csat (
+            id SERIAL PRIMARY KEY,
+            session_id TEXT NOT NULL UNIQUE,
+            rating SMALLINT NOT NULL,
+            comment TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS product_reviews (
+            id SERIAL PRIMARY KEY,
+            shoe_id INTEGER NOT NULL,
+            rating SMALLINT NOT NULL,
+            comment TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+try:
+    ensure_feedback_tables()
+    print("Feedback tables ready.")
+except Exception as e:
+    print(f"Could not create feedback tables ({e}) - CSAT and reviews will not persist.")
+
 
 # ==========================================
 # GOVERNANCE: PII
@@ -388,8 +438,24 @@ def check_reasoning_complexity(text: str, trace: list) -> bool:
 # AGENT: VISION SPECIALIST
 # ==========================================
 @observe(as_type="generation", name="Vision_Agent")
-def run_vision_agent(image_part: types.Part, trace: list) -> str | None:
+def run_vision_agent(image_part: types.Part, trace: list) -> dict:
+    """Returns {"verdict": ..., "description": ...}.
+
+    Two layers of protection. Gemini's own platform-level safety filters run
+    first and block the most severe categories before we see anything - that
+    is the primary control, and we detect and log when it fires rather than
+    letting it fail silently. The verdict below is a second, application-level
+    layer for content that is unsuitable for a retail context but would not be
+    platform-blocked, such as an image dominated by an identifiable person.
+    """
     trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: Analyzing uploaded image...")
+
+    def tag(verdict: str):
+        try:
+            get_client().update_current_span(metadata={"image_verdict": verdict})
+        except Exception:
+            pass
+
     try:
         prompt = get_client().get_prompt("veloxa-vision-agent", fallback=FALLBACK_VISION_AGENT_PROMPT)
         try:
@@ -402,12 +468,57 @@ def run_vision_agent(image_part: types.Part, trace: list) -> str | None:
             [types.Content(role="user", parts=[image_part])],
             vision_config, trace,
         )
-        description = response.text.strip()
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent output: {description}")
-        return description
+
+        # Layer 1: did Gemini's own safety filter block this? Previously this
+        # surfaced only as a crash on response.text and was swallowed silently.
+        finish_reason = ""
+        if getattr(response, "candidates", None):
+            finish_reason = str(getattr(response.candidates[0], "finish_reason", "") or "").upper()
+        if "SAFETY" in finish_reason or "PROHIBITED" in finish_reason or "BLOCK" in finish_reason:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: BLOCKED by platform safety filter ({finish_reason}). Image rejected.")
+            tag("PLATFORM_BLOCKED")
+            return {"verdict": "INAPPROPRIATE", "description": None}
+
+        if not response.text:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: empty response - rejecting image rather than proceeding blind.")
+            tag("EMPTY_RESPONSE")
+            return {"verdict": "UNREADABLE", "description": None}
+
+        raw = response.text.strip()
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        first_line = lines[0].upper() if lines else ""
+
+        # Layer 2: application-level retail-context verdict.
+        if first_line.startswith("INAPPROPRIATE"):
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: verdict INAPPROPRIATE - image rejected, not passed to retrieval.")
+            tag("INAPPROPRIATE")
+            return {"verdict": "INAPPROPRIATE", "description": None}
+
+        if first_line.startswith("NOT_PRODUCT"):
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: verdict NOT_PRODUCT - no footwear found in image.")
+            tag("NOT_PRODUCT")
+            return {"verdict": "NOT_PRODUCT", "description": None}
+
+        if not first_line.startswith("SAFE"):
+            # Unrecognised verdict - fail closed rather than assume it was fine.
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: unrecognised verdict '{lines[0] if lines else ''}' - failing closed.")
+            tag("UNRECOGNISED_VERDICT")
+            return {"verdict": "UNREADABLE", "description": None}
+
+        description = " ".join(lines[1:]).strip()
+        if not description:
+            trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: verdict SAFE but no description returned.")
+            tag("SAFE_NO_DESCRIPTION")
+            return {"verdict": "UNREADABLE", "description": None}
+
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: verdict SAFE. Output: {description}")
+        tag("SAFE")
+        return {"verdict": "SAFE", "description": description}
+
     except Exception as e:
-        trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: failed ({type(e).__name__}) - continuing on text alone.")
-        return None
+        trace.append(f"[{time.strftime('%H:%M:%S')}] Vision Agent: failed ({type(e).__name__}) - rejecting image rather than proceeding blind.")
+        tag("ERROR")
+        return {"verdict": "UNREADABLE", "description": None}
 
 
 # ==========================================
@@ -727,7 +838,26 @@ def run_agent(
     try:
         vision_description = None
         if image_part:
-            vision_description = run_vision_agent(image_part, trace)
+            vision_result = run_vision_agent(image_part, trace)
+            if vision_result["verdict"] == "INAPPROPRIATE":
+                return {
+                    "reply": "I'm not able to work with that image. If you'd like help finding footwear, you're welcome to upload a photo of a shoe, or just describe what you're looking for.",
+                    "recommendations": [],
+                    "cacheable": False,
+                }
+            if vision_result["verdict"] == "NOT_PRODUCT":
+                return {
+                    "reply": "I couldn't find any footwear in that image. Could you upload a photo of the shoe itself, or describe the style you're after?",
+                    "recommendations": [],
+                    "cacheable": False,
+                }
+            if vision_result["verdict"] == "UNREADABLE":
+                return {
+                    "reply": "I wasn't able to read that image clearly. Could you try a different photo, or tell me what you're looking for instead?",
+                    "recommendations": [],
+                    "cacheable": False,
+                }
+            vision_description = vision_result["description"]
 
         search_query = build_search_query(vision_description or safe_text, history)
         relevant_shoes, relevance_scores = retrieve_relevant_shoes(search_query, trace)
@@ -977,6 +1107,82 @@ def log_cart_action(request: CartLogRequest):
         get_client().flush()
     return {"status": "logged"}
 
+class CsatRequest(BaseModel):
+    session_id: str
+    rating: int  # 1 (lowest) to 5 (highest)
+    comment: str | None = None
+
+
+@app.post("/csat")
+def submit_csat(request: CsatRequest):
+    if not 1 <= request.rating <= 5:
+        return {"status": "rejected", "reason": "rating must be between 1 and 5"}
+    comment = (request.comment or "").strip()[:1000] or None
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur = conn.cursor()
+        # One rating per session - resubmitting updates rather than duplicating.
+        cur.execute("""
+            INSERT INTO conversation_csat (session_id, rating, comment)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (session_id)
+            DO UPDATE SET rating = EXCLUDED.rating, comment = EXCLUDED.comment, created_at = NOW()
+        """, (request.session_id, request.rating, comment))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "recorded"}
+    except Exception as e:
+        return {"status": "error", "detail": f"{type(e).__name__}: {e}"}
+
+
+class ReviewRequest(BaseModel):
+    shoe_id: int
+    rating: int  # 1-5 stars
+    comment: str | None = None
+
+
+@app.post("/reviews")
+def submit_review(request: ReviewRequest):
+    if not 1 <= request.rating <= 5:
+        return {"status": "rejected", "reason": "rating must be between 1 and 5"}
+    comment = (request.comment or "").strip()[:1000] or None
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO product_reviews (shoe_id, rating, comment) VALUES (%s, %s, %s)",
+            (request.shoe_id, request.rating, comment),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status": "recorded"}
+    except Exception as e:
+        return {"status": "error", "detail": f"{type(e).__name__}: {e}"}
+
+
+@app.get("/reviews/{shoe_id}")
+def get_reviews(shoe_id: int):
+    try:
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT rating, comment, created_at FROM product_reviews
+            WHERE shoe_id = %s ORDER BY created_at DESC LIMIT 20
+        """, (shoe_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        reviews = [
+            {"rating": r[0], "comment": r[1], "created_at": r[2].isoformat() if r[2] else None}
+            for r in rows
+        ]
+        avg = round(sum(r["rating"] for r in reviews) / len(reviews), 1) if reviews else None
+        return {"reviews": reviews, "average_rating": avg, "count": len(reviews)}
+    except Exception as e:
+        return {"reviews": [], "average_rating": None, "count": 0, "error": f"{type(e).__name__}: {e}"}
+
 
 @app.get("/")
 def read_root():
@@ -1010,6 +1216,16 @@ def admin_metrics():
         "price_accuracy_pct": None,
         "colour_flag_count": None,
         "intent_distribution": None,
+        "images_analysed": None,
+        "images_rejected": None,
+        "images_platform_blocked": None,
+        "csat_score_pct": None,
+        "csat_responses": None,
+        "avg_csat_rating": None,
+        "csat_with_comments": None,
+        "avg_product_rating": None,
+        "review_count": None,
+        "reviews_with_comments": None,
         "error": None,
     }
 
@@ -1108,7 +1324,38 @@ def admin_metrics():
             k: sum(1 for o in obs_list if meta_has(o, "intent_classification", k))
             for k in ["CONTINUE", "ESCALATE", "DECLINE_PROMPT", "DECLINE_PRIVACY", "OFF_TOPIC"]
         }
+        image_verdicts = [(o.get("metadata") or {}).get("image_verdict") for o in obs_list]
+        image_verdicts = [v for v in image_verdicts if v]
+        result["images_analysed"] = len(image_verdicts)
+        result["images_rejected"] = sum(1 for v in image_verdicts if v in ("INAPPROPRIATE", "PLATFORM_BLOCKED"))
+        result["images_platform_blocked"] = sum(1 for v in image_verdicts if v == "PLATFORM_BLOCKED")
 
+        # CSAT and product reviews live in PostgreSQL, not Langfuse - they are
+        # business data that gets read back and displayed, not trace data.
+        try:
+            conn = psycopg2.connect(os.getenv("DATABASE_URL"))
+            cur = conn.cursor()
+            cur.execute("SELECT rating, comment FROM conversation_csat WHERE created_at >= %s", (from_ts,))
+            csat_rows = cur.fetchall()
+            result["csat_responses"] = len(csat_rows)
+            if csat_rows:
+                ratings = [r[0] for r in csat_rows]
+                result["avg_csat_rating"] = round(sum(ratings) / len(ratings), 1)
+                # Standard CSAT definition: proportion answering 4 or 5.
+                result["csat_score_pct"] = round(sum(1 for r in ratings if r >= 4) / len(ratings) * 100, 1)
+                result["csat_with_comments"] = sum(1 for r in csat_rows if r[1])
+
+            cur.execute("SELECT rating, comment FROM product_reviews WHERE created_at >= %s", (from_ts,))
+            rows = cur.fetchall()
+            result["review_count"] = len(rows)
+            if rows:
+                result["avg_product_rating"] = round(sum(r[0] for r in rows) / len(rows), 1)
+                result["reviews_with_comments"] = sum(1 for r in rows if r[1])
+            cur.close()
+            conn.close()
+        except Exception as e:
+            if not result["error"]:
+                result["error"] = f"feedback query failed: {type(e).__name__}: {e}"
         chat_session_ids = {o.get("sessionId") for o in chat_requests if o.get("sessionId")}
         total_revenue = assisted_revenue = direct_revenue = 0.0
         for o in obs_list:
