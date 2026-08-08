@@ -840,6 +840,7 @@ def run_agent(
         if image_part:
             vision_result = run_vision_agent(image_part, trace)
             if vision_result["verdict"] == "INAPPROPRIATE":
+                trace.append(f"[{time.strftime('%H:%M:%S')}] Orchestrator: Request terminated at Layer 2. Vector retrieval, model routing and generation all skipped - zero generation tokens consumed.")
                 return {
                     "reply": "I'm not able to work with that image. If you'd like help finding footwear, you're welcome to upload a photo of a shoe, or just describe what you're looking for.",
                     "recommendations": [],
